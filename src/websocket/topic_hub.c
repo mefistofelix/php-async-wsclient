@@ -427,11 +427,28 @@ static bool ws_interest_matches(const topic_hub_t *hub, const int slot,
     return false;
 }
 
+#ifdef TAS_TEST_HOOKS
+/* Retry-path fault injection: when positive, the next N cross-worker posts fail as
+ * if the mailbox were full, forcing the park->retry path a test cannot provoke
+ * without a real backed-up consumer. Read and decremented under hub->admin (every
+ * post runs through topic_hub_post_locked holding the lock); the setter below writes
+ * it from the test thread before any send is triggered, and the admin mutex around
+ * the fan-out publishes that write — so reader and writer never overlap. */
+static int tas_test_force_full_posts = 0;
+#endif
+
 /* The mailbox is freed by its own worker on detach, and thread_mailbox's
  * contract is "free after producers have quiesced" — so claiming a slot,
  * retiring it and posting into it all happen under `admin`. */
 static bool topic_hub_post_locked(topic_hub_t *hub, const int slot, ws_cmd_t *cmd)
 {
+#ifdef TAS_TEST_HOOKS
+    if (UNEXPECTED(tas_test_force_full_posts > 0)) {
+        tas_test_force_full_posts--;
+        return false;   /* simulate a full target mailbox for this post */
+    }
+#endif
+
     thread_mailbox_t *const inbox = hub->inbox[slot];
 
     return inbox != NULL && thread_mailbox_post(inbox, cmd);
@@ -1462,3 +1479,44 @@ topic_hub_send_result_t topic_hub_send(topic_hub_t *hub, const char *topic, cons
 
     return result;
 }
+
+/* ------------------------------------------------------------ test hooks */
+
+#ifdef TAS_TEST_HOOKS
+/* proto void TrueAsync\__test_force_topic_post_full(int $n)
+ * Make the next $n cross-worker posts (fan-out or retry) fail as if the target
+ * mailbox were full, so a test can force the park -> retry path deterministically
+ * without a real backed-up consumer. Runs on the thread that calls it; the counter
+ * it sets is read under hub->admin by topic_hub_post_locked. */
+PHP_FUNCTION(topic_hub_test_force_post_full)
+{
+    zend_long n;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(n)
+    ZEND_PARSE_PARAMETERS_END();
+
+    tas_test_force_full_posts = n > 0 ? (int) n : 0;
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_topic_hub_test_force_post_full, 0, 1, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, n, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+static const zend_function_entry topic_hub_test_functions[] = {
+    ZEND_RAW_FENTRY(ZEND_NS_NAME("TrueAsync", "__test_force_topic_post_full"),
+                    zif_topic_hub_test_force_post_full,
+                    arginfo_topic_hub_test_force_post_full, 0, NULL, NULL)
+    ZEND_FE_END
+};
+
+void topic_hub_test_register(const int module_type)
+{
+    zend_register_functions(NULL, topic_hub_test_functions, NULL, module_type);
+}
+#else
+void topic_hub_test_register(const int module_type)
+{
+    (void) module_type;
+}
+#endif /* TAS_TEST_HOOKS */

@@ -34,6 +34,13 @@ PHP_ARG_ENABLE([http-server-test-hooks],
   [no],
   [no])
 
+PHP_ARG_ENABLE([tas-test-hooks],
+  [whether to compile reliable-room test hooks],
+  [AS_HELP_STRING([--enable-tas-test-hooks],
+    [Compile the reliable-room fault-injection test hook (forces a full cross-worker mailbox so the retry path is reachable by tests). For test/CI builds only; never enable for release.])],
+  [no],
+  [no])
+
 PHP_ARG_WITH([openssl],
   [for OpenSSL TLS support],
   [AS_HELP_STRING([--with-openssl@<:@=DIR@:>@],
@@ -697,9 +704,17 @@ if test "$PHP_HTTP_SERVER" != "no"; then
     HTTP_SERVER_TEST_HOOKS_FLAG="-DHTTP_SERVER_TEST_HOOKS=1"
   fi
 
+  dnl Reliable-room fault-injection hook (forces a full cross-worker mailbox).
+  dnl Same discipline as above: gated behind a define, absent from a release build.
+  TAS_TEST_HOOKS_FLAG=""
+  if test "$PHP_TAS_TEST_HOOKS" = "yes"; then
+    AC_MSG_NOTICE([http_server: reliable-room test hooks ENABLED — do not ship this build])
+    TAS_TEST_HOOKS_FLAG="-DTAS_TEST_HOOKS=1"
+  fi
+
   dnl Create extension. The trailing "cxx" arg makes the shared module link
   dnl through $(CXX) so the C++ TU's runtime (libstdc++) is pulled in.
-  PHP_NEW_EXTENSION(true_async_server, $http_server_sources, $ext_shared,, -Wall -Wextra -Wno-unused-parameter $HTTP_SERVER_HARDENING $HTTP_SERVER_TEST_HOOKS_FLAG $HTTP_SERVER_WSLAY_DEFS, cxx)
+  PHP_NEW_EXTENSION(true_async_server, $http_server_sources, $ext_shared,, -Wall -Wextra -Wno-unused-parameter $HTTP_SERVER_HARDENING $HTTP_SERVER_TEST_HOOKS_FLAG $TAS_TEST_HOOKS_FLAG $HTTP_SERVER_WSLAY_DEFS, cxx)
   PHP_SUBST(TRUE_ASYNC_SERVER_SHARED_LIBADD)
 
   dnl Add include paths

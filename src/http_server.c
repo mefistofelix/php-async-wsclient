@@ -28,6 +28,7 @@
 #include "http_send_file.h"
 #ifdef HAVE_HTTP_SERVER_WEBSOCKET
 # include "websocket/php_websocket.h"
+# include "websocket/topic_hub.h"
 #endif
 
 #ifdef HAVE_HTTP2
@@ -219,6 +220,11 @@ PHP_MINIT_FUNCTION(http_server)
 
 	/* Test-only C hooks; a no-op unless built with HTTP_SERVER_TEST_HOOKS. */
 	reactor_pool_test_register(type);
+
+#ifdef HAVE_HTTP_SERVER_WEBSOCKET
+	/* Reliable-room fault-injection hook; a no-op unless built with TAS_TEST_HOOKS. */
+	topic_hub_test_register(type);
+#endif
 
 	return SUCCESS;
 }
