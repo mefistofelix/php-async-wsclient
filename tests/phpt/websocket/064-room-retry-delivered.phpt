@@ -1,0 +1,118 @@
+--TEST--
+Rooms reliable-send: a full target parks then a retry lands it (retry_queued -> retry_delivered)
+--SKIPIF--
+<?php
+if (!function_exists('TrueAsync\\__test_force_topic_post_full')) {
+    echo "skip requires --enable-tas-test-hooks (fault-injection hook absent)";
+}
+?>
+--EXTENSIONS--
+true_async_server
+true_async
+--FILE--
+<?php
+/* The fault-injection hook forces the next cross-worker post to fail as if the
+ * target mailbox were full, so a blocking send() must PARK the target on the
+ * outbound queue and the reactor drainer must retry it — which then lands, since
+ * the very next post succeeds. We assert both counters move and every subscriber
+ * gets the message.
+ *
+ * The scenario runs INSIDE a worker handler (only an attached worker owns an
+ * outbound queue — the pool parent has none). The handler captures the server
+ * object (a Room handle transferred to a worker is not valid there; the server
+ * reaches the hub); getRuntimeStats() is read from the parent. */
+require_once __DIR__ . '/../server/_free_port.inc';
+require_once __DIR__ . '/_ws_client.inc';
+
+use TrueAsync\HttpServer;
+use TrueAsync\HttpServerConfig;
+use TrueAsync\WebSocket;
+use TrueAsync\HttpRequest;
+use function Async\spawn;
+use function Async\delay;
+
+const SUBS = 12;   // spread over 2 workers => a remote worker certainly has one
+
+$port = tas_free_port();
+$server = new HttpServer(
+    (new HttpServerConfig())
+        ->addListener('127.0.0.1', $port)
+        ->setWorkers(2)
+        ->setReadTimeout(30)
+        ->setWriteTimeout(30)
+        ->setWsPingIntervalMs(0)
+);
+$server->enableRooms();
+
+/* The handler captures the server (as 057 does) — a transferred Room handle is
+ * not valid on the worker, but the server is; send() reaches the hub through it. */
+$server->addWebSocketHandler(function (WebSocket $ws, HttpRequest $req) use ($server) {
+    if ($req->getPath() === '/ctl') {
+        foreach ($ws as $msg) {
+            if ($msg->data !== 'go') { continue; }
+
+            /* Fail exactly the one cross-worker post this send makes (2 workers =>
+             * one remote target); the retry that follows succeeds. */
+            \TrueAsync\__test_force_topic_post_full(1);
+
+            try {
+                $r = $server->send('rt', 'hi', 2000);
+                $ws->send("ret=$r");
+            } catch (\Throwable $e) {
+                $ws->send('exc=' . $e::class);
+            }
+        }
+        return;
+    }
+
+    $ws->subscribe('rt');
+    foreach ($ws as $msg) { /* receive only */ }
+});
+
+$server->addHttpHandler(function ($req, $res) { $res->setStatusCode(404)->end(); });
+
+spawn(function () use ($port, $server) {
+    delay(4000);   // both workers bind
+
+    $subs = [];
+    for ($i = 0; $i < SUBS; $i++) {
+        $fp = ws_open($port, '/');
+        if ($fp === null) { echo "sub handshake failed\n"; $server->stop(); return; }
+        $subs[] = $fp;
+    }
+    $ctl = ws_open($port, '/ctl');
+    if ($ctl === null) { echo "ctl handshake failed\n"; $server->stop(); return; }
+
+    delay(1200);   // subscribes land in each worker's tree
+
+    $before = $server->getRuntimeStats();
+
+    ws_write($ctl, 'go');
+    $reply = ws_await($ctl, 10000);
+
+    $after = $server->getRuntimeStats();
+
+    echo "reply: $reply\n";
+    echo 'retry_queued advanced: ',
+        ($after['ws_retry_queued'] - $before['ws_retry_queued']) >= 1 ? 'yes' : 'no', "\n";
+    echo 'retry_delivered advanced: ',
+        ($after['ws_retry_delivered'] - $before['ws_retry_delivered']) >= 1 ? 'yes' : 'no', "\n";
+
+    $got = 0;
+    foreach ($subs as $fp) {
+        if (ws_await($fp, 3000) === 'hi') { $got++; }
+    }
+    echo 'all subscribers received: ', $got === SUBS ? 'yes' : "no ($got)", "\n";
+
+    foreach ($subs as $fp) { @fclose($fp); }
+    @fclose($ctl);
+    $server->stop();
+});
+
+$server->start();
+?>
+--EXPECTF--
+reply: ret=1
+retry_queued advanced: yes
+retry_delivered advanced: yes
+all subscribers received: yes%A

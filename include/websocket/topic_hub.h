@@ -205,4 +205,9 @@ void topic_hub_get_stats(topic_hub_t *hub, topic_hub_stats_t *out);
 void topic_hub_interest_add(topic_hub_t *hub, const char *filter, size_t prefix_len);
 void topic_hub_interest_remove(topic_hub_t *hub, const char *filter, size_t prefix_len);
 
+/* Registers the reliable-room test hook (TrueAsync\__test_force_topic_post_full).
+ * A no-op unless the extension was built with --enable-tas-test-hooks. Called from
+ * MINIT. */
+void topic_hub_test_register(int module_type);
+
 #endif /* TOPIC_HUB_H */
