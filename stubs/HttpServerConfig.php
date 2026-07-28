@@ -491,6 +491,45 @@ final class HttpServerConfig
     public function getWsPublishBurst(): int {}
 
     /**
+     * Reliable-send retry cadence in milliseconds — how long {@see Room::send()}
+     * waits (a coroutine sleep) between retries of a target whose mailbox was
+     * full. Smaller means a full target is recovered sooner, at more attempts.
+     *
+     * Default: 50. Applies to Room::send()/HttpServer::send() only; publish()
+     * never retries.
+     */
+    public function setWsPublishRetryIntervalMs(int $ms): static {}
+
+    /** @return int */
+    public function getWsPublishRetryIntervalMs(): int {}
+
+    /**
+     * Default deadline in milliseconds for a reliable send: how long the outbound
+     * drainer keeps retrying a still-full target before giving up — the message is
+     * dropped (counted `retry_expired` in {@see HttpServer::getRuntimeStats()}),
+     * and a blocking {@see Room::send()} throws. A per-call $timeoutMs overrides.
+     *
+     * Default: 5000.
+     */
+    public function setWsPublishRetryTimeoutMs(int $ms): static {}
+
+    /** @return int */
+    public function getWsPublishRetryTimeoutMs(): int {}
+
+    /**
+     * Per-worker cap on the reliable-send outbound queue. When it is full,
+     * {@see Room::trySend()} returns false and {@see Room::send()} throws, parking
+     * nothing — the honest bound (NATS-style) that keeps a wedged consumer from
+     * growing the sender without limit.
+     *
+     * Default: 4096.
+     */
+    public function setWsPublishRetryQueueMax(int $count): static {}
+
+    /** @return int */
+    public function getWsPublishRetryQueueMax(): int {}
+
+    /**
      * Server-initiated PING cadence in milliseconds. The server sends a
      * PING this often on otherwise-idle connections; the peer must reply
      * with PONG within WsPongTimeoutMs or the connection is torn down

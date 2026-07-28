@@ -5623,9 +5623,118 @@ ZEND_METHOD(TrueAsync_HttpServer, getRuntimeStats)
     add_assoc_long(return_value, "ws_topic_posted",  (zend_long)ws.posted);
     add_assoc_long(return_value, "ws_topic_skipped", (zend_long)ws.skipped);
     add_assoc_long(return_value, "ws_topic_dropped", (zend_long)ws.dropped);
+
+    add_assoc_long(return_value, "ws_retry_queued",    (zend_long)ws.retry_queued);
+    add_assoc_long(return_value, "ws_retry_delivered", (zend_long)ws.retry_delivered);
+    add_assoc_long(return_value, "ws_retry_expired",   (zend_long)ws.retry_expired);
+    add_assoc_long(return_value, "ws_retry_rejected",  (zend_long)ws.retry_rejected);
+    add_assoc_long(return_value, "ws_retry_gone",      (zend_long)ws.retry_gone);
+    add_assoc_long(return_value, "ws_retry_shutdown",  (zend_long)ws.retry_shutdown);
 #endif
 }
 /* }}} */
+
+#ifdef HAVE_HTTP_SERVER_WEBSOCKET
+/* {served, posted, dropped} — publish()'s honest per-call breakdown: local
+ * subscribers served synchronously on the calling worker, remote mailboxes that
+ * accepted the copy, and full remote mailboxes that dropped it. */
+static void room_publish_result(zval *return_value, uint32_t served,
+                                uint64_t posted, uint64_t dropped)
+{
+    array_init(return_value);
+    add_assoc_long(return_value, "served",  (zend_long) served);
+    add_assoc_long(return_value, "posted",  (zend_long) posted);
+    add_assoc_long(return_value, "dropped", (zend_long) dropped);
+}
+
+/* Resolve the three reliable-send knobs: per-call timeoutMs (null ⇒ configured
+ * default), plus interval and queue cap always from config. Falls back to the
+ * documented defaults if a config value is unset. */
+static void room_retry_knobs(http_server_object *server, bool timeout_is_null,
+        zend_long timeout_ms, uint32_t *timeout, uint32_t *interval, uint32_t *queue_max)
+{
+    const http_server_config_t *const cfg = http_server_get_config(server);
+
+    *interval  = (cfg != NULL && cfg->ws_publish_retry_interval_ms != 0)
+        ? cfg->ws_publish_retry_interval_ms : 50u;
+    *queue_max = (cfg != NULL && cfg->ws_publish_retry_queue_max != 0)
+        ? cfg->ws_publish_retry_queue_max : 4096u;
+
+    if (timeout_is_null) {
+        *timeout = (cfg != NULL && cfg->ws_publish_retry_timeout_ms != 0)
+            ? cfg->ws_publish_retry_timeout_ms : 5000u;
+    } else if (timeout_ms < 0) {
+        *timeout = 0u;
+    } else if ((zend_ulong) timeout_ms > UINT32_MAX) {
+        *timeout = UINT32_MAX;   /* clamp both ends, matching the config setters' range */
+    } else {
+        *timeout = (uint32_t) timeout_ms;
+    }
+}
+
+/* Throw RoomDeliveryException with its readonly delivered/pending props set — the
+ * WebSocketClosedException one-time-init pattern (direct slot writes past the
+ * readonly guard). */
+static void room_throw_delivery(const char *msg, uint32_t delivered, uint32_t pending)
+{
+    zval ex;
+    object_init_ex(&ex, room_delivery_exception_ce);
+    zend_object *const obj = Z_OBJ(ex);
+
+    zend_update_property_string(zend_ce_exception, obj, ZEND_STRL("message"), msg);
+
+    const zend_property_info *const pd = zend_hash_str_find_ptr(
+        &room_delivery_exception_ce->properties_info, ZEND_STRL("delivered"));
+    zval *const slot_d = OBJ_PROP(obj, pd->offset);
+    zval_ptr_dtor(slot_d);
+    ZVAL_LONG(slot_d, delivered);
+
+    const zend_property_info *const pp = zend_hash_str_find_ptr(
+        &room_delivery_exception_ce->properties_info, ZEND_STRL("pending"));
+    zval *const slot_p = OBJ_PROP(obj, pp->offset);
+    zval_ptr_dtor(slot_p);
+    ZVAL_LONG(slot_p, pending);
+
+    zend_throw_exception_object(&ex);
+}
+
+/* Map a reliable-send result onto return_value (int = targets delivered, on OK)
+ * or a thrown RoomDeliveryException carrying delivered/pending. */
+static void room_send_apply(zval *return_value, const topic_hub_send_result_t *r)
+{
+    switch (r->status) {
+        case TOPIC_HUB_SEND_OK:
+            ZVAL_LONG(return_value, (zend_long) r->delivered);
+            return;
+        case TOPIC_HUB_SEND_QUEUE_FULL:
+            room_throw_delivery(
+                "Reliable send refused: the outbound retry queue is at its cap (setWsPublishRetryQueueMax)",
+                r->delivered, r->pending);
+            return;
+        case TOPIC_HUB_SEND_NO_CONTEXT:
+            room_throw_delivery(
+                "Room::send() must be called from a coroutine; use trySend() outside one",
+                r->delivered, r->pending);
+            return;
+        case TOPIC_HUB_SEND_NO_QUEUE:
+            room_throw_delivery(
+                "Reliable send unavailable: this thread has no worker outbound queue to retry on",
+                r->delivered, r->pending);
+            return;
+        case TOPIC_HUB_SEND_SHUTDOWN:
+            room_throw_delivery(
+                "Reliable send interrupted: the worker shut down while the message was in flight",
+                r->delivered, r->pending);
+            return;
+        case TOPIC_HUB_SEND_EXPIRED:
+        default:
+            room_throw_delivery(
+                "Reliable send timed out: a target mailbox was still full at the deadline",
+                r->delivered, r->pending);
+            return;
+    }
+}
+#endif /* HAVE_HTTP_SERVER_WEBSOCKET */
 
 /* {{{ proto HttpServer::enableRooms(): static
  * Opt into cross-worker rooms: allocate the topic hub up front so room
@@ -5689,21 +5798,132 @@ ZEND_METHOD(TrueAsync_HttpServer, publish)
         return;
     }
 
+    uint64_t posted = 0, dropped = 0;
+
     const uint32_t served = topic_hub_publish(
         (topic_hub_t *) server->topic_hub,
         ZSTR_VAL(topic), ZSTR_LEN(topic),
         ZSTR_VAL(message), ZSTR_LEN(message),
         binary,
-        /* except_id: 0 = server origin, exclude nobody */ 0
+        /* except_id: 0 = server origin, exclude nobody */ 0,
+        &posted, &dropped
     );
 
-    RETURN_LONG((zend_long) served);
+    room_publish_result(return_value, served, posted, dropped);
 #else
     (void) topic;
     (void) message;
     (void) binary;
     (void) server;
 
+    zend_throw_exception(http_server_runtime_exception_ce,
+        "Rooms require the extension built with WebSocket support (--enable-websocket)", 0);
+#endif
+}
+/* }}} */
+
+/* {{{ proto HttpServer::trySend(string $topic, string $message, ?int $timeoutMs = null): bool
+ * Reliable non-blocking send: fan out, park full targets on the outbound queue,
+ * return at once. See Room::trySend(). */
+ZEND_METHOD(TrueAsync_HttpServer, trySend)
+{
+    zend_string *topic;
+    zend_string *message;
+    zend_long    timeout_ms      = 0;
+    bool         timeout_is_null = true;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STR(topic)
+        Z_PARAM_STR(message)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG_OR_NULL(timeout_ms, timeout_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    http_server_object *server = Z_HTTP_SERVER_P(ZEND_THIS);
+
+#ifdef HAVE_HTTP_SERVER_WEBSOCKET
+    if (server->topic_hub == NULL) {
+        zend_throw_exception(http_server_runtime_exception_ce,
+            "Rooms are not available: call enableRooms() or addWebSocketHandler() before start()", 0);
+        return;
+    }
+
+    if (!ws_topic_is_valid_name(ZSTR_VAL(topic), ZSTR_LEN(topic))) {
+        zend_throw_exception(http_server_invalid_argument_exception_ce,
+            "Invalid room name: a send topic must be a concrete name (no '+' or '#' wildcards)", 0);
+        return;
+    }
+
+    uint32_t timeout, interval, queue_max;
+    room_retry_knobs(server, timeout_is_null, timeout_ms, &timeout, &interval, &queue_max);
+
+    const bool ok = topic_hub_try_send(
+        (topic_hub_t *) server->topic_hub,
+        ZSTR_VAL(topic), ZSTR_LEN(topic),
+        ZSTR_VAL(message), ZSTR_LEN(message),
+        /* binary */ false, /* except_id */ 0,
+        timeout, interval, queue_max);
+
+    RETURN_BOOL(ok);
+#else
+    (void) topic; (void) message; (void) timeout_ms; (void) timeout_is_null; (void) server;
+    zend_throw_exception(http_server_runtime_exception_ce,
+        "Rooms require the extension built with WebSocket support (--enable-websocket)", 0);
+#endif
+}
+/* }}} */
+
+/* {{{ proto HttpServer::send(string $topic, string $message, ?int $timeoutMs = null): int
+ * Reliable blocking send: suspends until every target lands or the deadline
+ * passes (then throws RoomDeliveryException). See Room::send(). */
+ZEND_METHOD(TrueAsync_HttpServer, send)
+{
+    zend_string *topic;
+    zend_string *message;
+    zend_long    timeout_ms      = 0;
+    bool         timeout_is_null = true;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STR(topic)
+        Z_PARAM_STR(message)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG_OR_NULL(timeout_ms, timeout_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    http_server_object *server = Z_HTTP_SERVER_P(ZEND_THIS);
+
+#ifdef HAVE_HTTP_SERVER_WEBSOCKET
+    if (server->topic_hub == NULL) {
+        zend_throw_exception(http_server_runtime_exception_ce,
+            "Rooms are not available: call enableRooms() or addWebSocketHandler() before start()", 0);
+        return;
+    }
+
+    if (!ws_topic_is_valid_name(ZSTR_VAL(topic), ZSTR_LEN(topic))) {
+        zend_throw_exception(http_server_invalid_argument_exception_ce,
+            "Invalid room name: a send topic must be a concrete name (no '+' or '#' wildcards)", 0);
+        return;
+    }
+
+    uint32_t timeout, interval, queue_max;
+    room_retry_knobs(server, timeout_is_null, timeout_ms, &timeout, &interval, &queue_max);
+
+    const topic_hub_send_result_t r = topic_hub_send(
+        (topic_hub_t *) server->topic_hub,
+        ZSTR_VAL(topic), ZSTR_LEN(topic),
+        ZSTR_VAL(message), ZSTR_LEN(message),
+        /* binary */ false, /* except_id */ 0,
+        timeout, interval, queue_max);
+
+    /* A cancellation left an exception pending across the suspend — let it
+     * propagate rather than mapping the (now meaningless) result. */
+    if (EG(exception) != NULL) {
+        return;
+    }
+
+    room_send_apply(return_value, &r);
+#else
+    (void) topic; (void) message; (void) timeout_ms; (void) timeout_is_null; (void) server;
     zend_throw_exception(http_server_runtime_exception_ce,
         "Rooms require the extension built with WebSocket support (--enable-websocket)", 0);
 #endif
@@ -5847,15 +6067,94 @@ ZEND_METHOD(TrueAsync_Room, publish)
         return;
     }
 
+    uint64_t posted = 0, dropped = 0;
+
     const uint32_t served = topic_hub_publish(
         (topic_hub_t *) server->topic_hub,
         ZSTR_VAL(room->topic), ZSTR_LEN(room->topic),
         ZSTR_VAL(message), ZSTR_LEN(message),
         /* binary */ false,
-        /* except_id */ 0
+        /* except_id */ 0,
+        &posted, &dropped
     );
 
-    RETURN_LONG((zend_long) served);
+    room_publish_result(return_value, served, posted, dropped);
+}
+/* }}} */
+
+/* {{{ proto Room::trySend(string $message, ?int $timeoutMs = null): bool */
+ZEND_METHOD(TrueAsync_Room, trySend)
+{
+    zend_string *message;
+    zend_long    timeout_ms      = 0;
+    bool         timeout_is_null = true;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(message)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG_OR_NULL(timeout_ms, timeout_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    room_object *room = Z_ROOM_P(ZEND_THIS);
+    http_server_object *server = http_server_from_obj(Z_OBJ(room->server_zv));
+
+    if (server->topic_hub == NULL) {
+        zend_throw_exception(http_server_runtime_exception_ce,
+            "Rooms are not available: start() the server first", 0);
+        return;
+    }
+
+    uint32_t timeout, interval, queue_max;
+    room_retry_knobs(server, timeout_is_null, timeout_ms, &timeout, &interval, &queue_max);
+
+    const bool ok = topic_hub_try_send(
+        (topic_hub_t *) server->topic_hub,
+        ZSTR_VAL(room->topic), ZSTR_LEN(room->topic),
+        ZSTR_VAL(message), ZSTR_LEN(message),
+        /* binary */ false, /* except_id */ 0,
+        timeout, interval, queue_max);
+
+    RETURN_BOOL(ok);
+}
+/* }}} */
+
+/* {{{ proto Room::send(string $message, ?int $timeoutMs = null): int */
+ZEND_METHOD(TrueAsync_Room, send)
+{
+    zend_string *message;
+    zend_long    timeout_ms      = 0;
+    bool         timeout_is_null = true;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(message)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG_OR_NULL(timeout_ms, timeout_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    room_object *room = Z_ROOM_P(ZEND_THIS);
+    http_server_object *server = http_server_from_obj(Z_OBJ(room->server_zv));
+
+    if (server->topic_hub == NULL) {
+        zend_throw_exception(http_server_runtime_exception_ce,
+            "Rooms are not available: start() the server first", 0);
+        return;
+    }
+
+    uint32_t timeout, interval, queue_max;
+    room_retry_knobs(server, timeout_is_null, timeout_ms, &timeout, &interval, &queue_max);
+
+    const topic_hub_send_result_t r = topic_hub_send(
+        (topic_hub_t *) server->topic_hub,
+        ZSTR_VAL(room->topic), ZSTR_LEN(room->topic),
+        ZSTR_VAL(message), ZSTR_LEN(message),
+        /* binary */ false, /* except_id */ 0,
+        timeout, interval, queue_max);
+
+    if (EG(exception) != NULL) {
+        return;   /* a cancellation is already pending across the suspend */
+    }
+
+    room_send_apply(return_value, &r);
 }
 /* }}} */
 
@@ -5882,7 +6181,8 @@ ZEND_METHOD(TrueAsync_Room, publishBinary)
         ZSTR_VAL(room->topic), ZSTR_LEN(room->topic),
         ZSTR_VAL(data), ZSTR_LEN(data),
         /* binary */ true,
-        /* except_id */ 0
+        /* except_id */ 0,
+        /* posted_out */ NULL, /* dropped_out */ NULL
     );
 
     RETURN_LONG((zend_long) served);

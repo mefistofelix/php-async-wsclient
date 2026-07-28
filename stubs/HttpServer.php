@@ -90,10 +90,37 @@ final class HttpServer
      * {@see WebSocket::publish()} there is no sending connection, so nobody is
      * excluded. $topic must be a concrete name (no `+` or `#` wildcards).
      *
-     * @return int Subscribers served on the calling worker. Delivery to other
-     *             workers is asynchronous, so this is a local count, not a total.
+     * @return array{served: int, posted: int, dropped: int} Per-call delivery
+     *         breakdown: `served` local subscribers on the calling worker,
+     *         `posted` remote worker mailboxes that accepted the copy, `dropped`
+     *         full remote mailboxes that lost it (best-effort — use send() /
+     *         trySend() when a full mailbox must be retried instead of dropped).
      */
-    public function publish(string $topic, string $message, bool $binary = false): int {}
+    public function publish(string $topic, string $message, bool $binary = false): array {}
+
+    /**
+     * Reliable server-side send to a room, NON-BLOCKING. Parks a full target on
+     * the outbound queue for background retry and returns at once. See
+     * {@see Room::trySend()} for the full contract; this is the same without a
+     * {@see Room} handle.
+     *
+     * @param int|null $timeoutMs Retry deadline; null uses the configured default.
+     * @return bool True if delivered or parked; false if the outbound queue is full.
+     */
+    public function trySend(string $topic, string $message, ?int $timeoutMs = null): bool {}
+
+    /**
+     * Reliable server-side send to a room, BLOCKING. Suspends the calling
+     * coroutine until delivered or the deadline passes, then THROWS. See
+     * {@see Room::send()} for the full contract; this is the same without holding
+     * a {@see Room} handle.
+     *
+     * @param int|null $timeoutMs Retry deadline; null uses the configured default.
+     * @return int Targets the message was delivered to.
+     * @throws RoomDeliveryException if the deadline passed with a target still
+     *         full, the outbound queue was full, or called outside a coroutine.
+     */
+    public function send(string $topic, string $message, ?int $timeoutMs = null): int {}
 
     /**
      * Count the subscribers of a room across all workers (scatter/gather).

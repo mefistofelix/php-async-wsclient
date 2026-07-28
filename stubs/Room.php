@@ -25,12 +25,15 @@ final class Room
     private function __construct() {}
 
     /**
-     * Publish a text message to this room.
+     * Publish a text message to this room (best-effort, no retry).
      *
-     * @return int Subscribers served on the calling worker. Delivery to other
-     *             workers is asynchronous, so this is a local count, not a total.
+     * @return array{served: int, posted: int, dropped: int} Per-call delivery
+     *         breakdown: `served` local subscribers on the calling worker,
+     *         `posted` remote worker mailboxes that accepted the copy, `dropped`
+     *         full remote mailboxes that lost it. Delivery to other workers is
+     *         asynchronous, so `served` is a local count, not a total.
      */
-    public function publish(string $message): int {}
+    public function publish(string $message): array {}
 
     /**
      * Publish a binary message to this room.
@@ -38,6 +41,51 @@ final class Room
      * @return int Subscribers served on the calling worker.
      */
     public function publishBinary(string $data): int {}
+
+    /**
+     * Reliable send, NON-BLOCKING. Fans out now; for every target whose mailbox
+     * is full, parks a retry entry on this worker's outbound queue and returns at
+     * once — a background drainer retries it up to the deadline. Unlike
+     * {@see publish()}, nothing is silently dropped, and the caller gets an
+     * immediate, honest answer.
+     *
+     * @param int|null $timeoutMs How long the background drainer keeps retrying a
+     *        still-full target. Null uses
+     *        {@see HttpServerConfig::setWsPublishRetryTimeoutMs()}.
+     * @return bool True if delivered outright or parked for retry; false if the
+     *         outbound queue is at {@see HttpServerConfig::setWsPublishRetryQueueMax()}
+     *         and nothing was parked — the caller must handle this now. The
+     *         eventual outcome of a parked message is in {@see HttpServer::getRuntimeStats()}.
+     */
+    public function trySend(string $message, ?int $timeoutMs = null): bool {}
+
+    /**
+     * Reliable send, BLOCKING. Same fan-out-and-park as {@see trySend()}, but the
+     * calling coroutine awaits the parked message's completion: it returns the
+     * number of targets delivered to once every target lands, or THROWS if the
+     * deadline passes with a target still full (or the queue was full at enqueue).
+     * The caller either knows it landed or catches the failure.
+     *
+     * A target that detached while we waited — its slot reused by a fresh worker —
+     * is skipped rather than mis-delivered, and does not by itself fail the send.
+     *
+     * Must run in a coroutine (it suspends). Because it blocks, use it for
+     * point-to-point coordination, NOT for a fan-out to many dashboards — that is
+     * what {@see publish()} is for.
+     *
+     * On failure the message may already have reached a subset of targets (the
+     * fast ones are posted during fan-out, before any verdict); the thrown
+     * exception carries how many landed, so re-sending — which duplicates on those
+     * — is a decision, not an accident.
+     *
+     * @param int|null $timeoutMs Retry deadline; null uses
+     *        {@see HttpServerConfig::setWsPublishRetryTimeoutMs()}.
+     * @return int Targets the message was delivered to.
+     * @throws RoomDeliveryException if the deadline passed with a target still
+     *         full, or the outbound queue was full at enqueue, or send() was
+     *         called outside a coroutine (use trySend() there).
+     */
+    public function send(string $message, ?int $timeoutMs = null): int {}
 
     /**
      * Count the subscribers of this room across all workers (scatter/gather).
