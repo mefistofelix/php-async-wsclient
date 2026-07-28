@@ -902,11 +902,10 @@ static void retry_entry_release(retry_entry_t *e)
     }
 }
 
-/* Tear down a freshly-built entry that never entered service — its enqueue could
- * not arm the drainer, so it was unlinked before any other holder saw it. It is
- * still sole-owned (never shared across a suspend or a post), so releasing the one
- * payload ref it took and freeing it outright is the whole teardown; the caller
- * disposes any blocking-send event separately (it created and still holds it). */
+/* Free an entry that never entered service — its enqueue could not arm the
+ * drainer. Still sole-owned (nothing shared it across a suspend or a post), so
+ * releasing its one payload ref and freeing it is the whole teardown. The caller
+ * disposes any blocking-send event; it owns that. */
 static void retry_entry_discard(retry_entry_t *e)
 {
     ws_payload_release(e->payload);
@@ -1341,8 +1340,8 @@ topic_hub_send_result_t topic_hub_send(topic_hub_t *hub, const char *topic, cons
     zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
 
     /* The caller chose the reliable path; with no coroutine to park we refuse
-     * rather than degrade to best-effort publish() (finding 5). Checked BEFORE any
-     * delivery so a NO_CONTEXT send is all-or-nothing. */
+     * rather than degrade to best-effort publish(). Checked before any delivery,
+     * so a NO_CONTEXT send is all-or-nothing. */
     if (coroutine == NULL || ZEND_ASYNC_IS_SCHEDULER_CONTEXT) {
         result.status = TOPIC_HUB_SEND_NO_CONTEXT;
         return result;
