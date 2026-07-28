@@ -106,9 +106,10 @@ typedef struct {
 } ws_cmd_t;
 
 /* One still-unfilled destination in a parked reliable send: the target worker's
- * slot plus the generation it was claimed with. The generation is the proof of
- * life — a slot reused by a fresh worker bumps its generation, so a retry on a
- * stale generation is a mis-delivery to be dropped (retry_gone), not delivered. */
+ * slot plus the generation it was claimed with. The generation detects slot
+ * REUSE — a fresh attach on the same slot bumps it, so a retry on a stale
+ * generation would mis-deliver and is dropped (retry_gone). A plain detach nulls
+ * the inbox WITHOUT bumping gen, so the drain checks both (see topic_hub_retry_drain). */
 typedef struct {
     int      slot;
     uint32_t gen;
@@ -849,18 +850,14 @@ uint32_t topic_hub_count(topic_hub_t *hub, const char *topic, const size_t topic
 
 /* ----------------------------------------------------------- reliable send
  *
- * publish() drops a copy into a full mailbox and bumps `dropped`. The two calls
- * below never drop silently: a full target is parked as a {slot,gen} on this
- * worker's thread-local outbound queue and retried by a one-shot reactor timer
- * until it lands, the deadline passes, or the target worker detaches. Flow
- * control is between the sender and the queue's cap, never between the sender and
- * the slowest consumer (the NATS model). See docs/PLAN_RELIABLE_ROOM_PUBLISH.md.
+ * The contract — publish() vs these, the queue, the config knobs — lives in
+ * topic_hub.h. Implementation: a full target is parked as a {slot,gen} on this
+ * worker's thread-local outbound queue and retried by the shared periodic timer
+ * until it lands, the deadline passes, or the target worker detaches.
  */
 
 static bool topic_hub_retry_arm(topic_hub_t *hub, ws_local_t *local);
 static void topic_hub_retry_drain(topic_hub_t *hub, ws_local_t *local);
-
-/* Ownership protocol cloned from ws_query_* — same early-resume/cancel hazards. */
 
 static retry_entry_t *retry_entry_new(const char *topic, const size_t topic_len,
         ws_payload_t *payload, const uint64_t except_id, const uint64_t deadline_ms,
@@ -902,11 +899,10 @@ static void retry_entry_release(retry_entry_t *e)
     }
 }
 
-/* Tear down a freshly-built entry that never entered service — its enqueue could
- * not arm the drainer, so it was unlinked before any other holder saw it. It is
- * still sole-owned (never shared across a suspend or a post), so releasing the one
- * payload ref it took and freeing it outright is the whole teardown; the caller
- * disposes any blocking-send event separately (it created and still holds it). */
+/* Free an entry that never entered service — its enqueue could not arm the
+ * drainer. Still sole-owned (nothing shared it across a suspend or a post), so
+ * releasing its one payload ref and freeing it is the whole teardown. The caller
+ * disposes any blocking-send event; it owns that. */
 static void retry_entry_discard(retry_entry_t *e)
 {
     ws_payload_release(e->payload);
@@ -980,7 +976,7 @@ static void topic_hub_retry_tick_fn(zend_async_event_t *event,
 static bool topic_hub_retry_arm(topic_hub_t *hub, ws_local_t *local)
 {
     if (local->retry_timer_armed) {
-        return true;   /* already running */
+        return true;
     }
 
     if (local->retry_timer == NULL) {
@@ -1211,7 +1207,7 @@ static bool topic_hub_retry_enqueue(topic_hub_t *hub, ws_local_t *local,
     /* The very first enqueue fixes the drainer cadence for the worker's life: the
      * MULTISHOT timer is created once at that interval and only paused/resumed
      * thereafter, never re-clocked (a per-call interval on a later send is ignored —
-     * documented first-wins). */
+     * first-wins). */
     if (local->retry_interval_ms == 0) {
         local->retry_interval_ms = interval_ms != 0 ? interval_ms : 50;
     }
@@ -1341,8 +1337,8 @@ topic_hub_send_result_t topic_hub_send(topic_hub_t *hub, const char *topic, cons
     zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
 
     /* The caller chose the reliable path; with no coroutine to park we refuse
-     * rather than degrade to best-effort publish() (finding 5). Checked BEFORE any
-     * delivery so a NO_CONTEXT send is all-or-nothing. */
+     * rather than degrade to best-effort publish(). Checked before any delivery,
+     * so a NO_CONTEXT send is all-or-nothing. */
     if (coroutine == NULL || ZEND_ASYNC_IS_SCHEDULER_CONTEXT) {
         result.status = TOPIC_HUB_SEND_NO_CONTEXT;
         return result;

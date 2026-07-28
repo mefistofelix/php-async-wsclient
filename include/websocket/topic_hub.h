@@ -124,8 +124,9 @@ typedef struct {
 } topic_hub_send_result_t;
 
 /* Non-blocking: fan out, park full targets, return at once. `true` = delivered
- * or parked; `false` = the outbound queue is at `queue_max` and nothing was
- * parked (counted retry_rejected). Any thread; never suspends. */
+ * or parked; `false` = nothing was parked — the queue is at `queue_max` or the
+ * drainer could not arm (counted retry_rejected), or the thread has no worker
+ * attachment (not counted). Any thread; never suspends. */
 bool topic_hub_try_send(topic_hub_t *hub, const char *topic, size_t topic_len,
                         const char *data, size_t len, bool binary, uint64_t except_id,
                         uint32_t timeout_ms, uint32_t interval_ms, uint32_t queue_max);
