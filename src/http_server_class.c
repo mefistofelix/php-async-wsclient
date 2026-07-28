@@ -5635,7 +5635,7 @@ ZEND_METHOD(TrueAsync_HttpServer, getRuntimeStats)
 /* }}} */
 
 #ifdef HAVE_HTTP_SERVER_WEBSOCKET
-/* {served, posted, dropped} — publish()'s honest per-call breakdown: local
+/* {served, posted, dropped} — publish()'s per-call delivery breakdown: local
  * subscribers served synchronously on the calling worker, remote mailboxes that
  * accepted the copy, and full remote mailboxes that dropped it. */
 static void room_publish_result(zval *return_value, uint32_t served,
