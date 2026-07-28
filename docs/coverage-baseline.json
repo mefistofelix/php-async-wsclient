@@ -1,12 +1,12 @@
 {
   "totals": {
     "lines": {
-      "total": 22413,
-      "hit": 18576
+      "total": 22948,
+      "hit": 18805
     },
     "functions": {
-      "total": 1563,
-      "hit": 1425
+      "total": 1592,
+      "hit": 1443
     }
   },
   "files": {
@@ -123,7 +123,7 @@
     "src/core/conn_arena.c": {
       "lines": {
         "total": 63,
-        "hit": 62
+        "hit": 63
       },
       "functions": {
         "total": 6,
@@ -423,7 +423,7 @@
     "src/http3/http3_callbacks.c": {
       "lines": {
         "total": 905,
-        "hit": 757
+        "hit": 758
       },
       "functions": {
         "total": 48,
@@ -672,22 +672,22 @@
     },
     "src/http_server_class.c": {
       "lines": {
-        "total": 2577,
-        "hit": 1929
+        "total": 2740,
+        "hit": 2022
       },
       "functions": {
-        "total": 143,
-        "hit": 125
+        "total": 151,
+        "hit": 131
       }
     },
     "src/http_server_config.c": {
       "lines": {
-        "total": 1657,
-        "hit": 1528
+        "total": 1708,
+        "hit": 1579
       },
       "functions": {
-        "total": 145,
-        "hit": 136
+        "total": 151,
+        "hit": 142
       }
     },
     "src/http_sse.c": {
@@ -792,8 +792,8 @@
     },
     "src/websocket/php_websocket.c": {
       "lines": {
-        "total": 605,
-        "hit": 477
+        "total": 607,
+        "hit": 479
       },
       "functions": {
         "total": 48,
@@ -802,12 +802,12 @@
     },
     "src/websocket/topic_hub.c": {
       "lines": {
-        "total": 279,
-        "hit": 257
+        "total": 598,
+        "hit": 338
       },
       "functions": {
-        "total": 25,
-        "hit": 25
+        "total": 40,
+        "hit": 31
       }
     },
     "src/websocket/websocket_strategy.c": {
