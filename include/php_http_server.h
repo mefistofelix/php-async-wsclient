@@ -270,6 +270,18 @@ struct _http_server_config_t {
     uint32_t ws_publish_rate;
     uint32_t ws_publish_burst;
 
+    /* Reliable room-send (Room::send/trySend) knobs. The hub holds no config of
+     * its own — these are read at call time and passed down to
+     * topic_hub_send/try_send.
+     *   ws_publish_retry_interval_ms — drainer cadence (default 50).
+     *   ws_publish_retry_timeout_ms  — default deadline; a per-call timeoutMs
+     *                                  overrides (default 5000).
+     *   ws_publish_retry_queue_max   — per-worker outbound queue cap, in ENTRIES
+     *                                  (default 4096). */
+    uint32_t ws_publish_retry_interval_ms;
+    uint32_t ws_publish_retry_timeout_ms;
+    uint32_t ws_publish_retry_queue_max;
+
     /* HTTP body compression (issues #8, #9). Phase 1 ships gzip via zlib-ng;
      * phase 2 adds Brotli + zstd through the same vtable.
      *   compression_enabled         — master switch (default true).

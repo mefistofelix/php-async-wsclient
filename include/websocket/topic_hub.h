@@ -76,10 +76,16 @@ uint64_t topic_hub_next_id(topic_hub_t *hub);
  * to the others is asynchronous, so an exact total would be a lie.
  *
  * A worker whose mailbox is full also drops the message, and that one is NOT in
- * the return value: it is counted in topic_hub_get_stats().dropped instead. */
+ * the return value: it is counted in topic_hub_get_stats().dropped instead.
+ *
+ * `posted_out`/`dropped_out` (either may be NULL) report THIS call's remote
+ * breakdown — mailboxes that accepted the copy vs full ones that dropped it — so
+ * a caller can surface a per-publish delivery result without reading the
+ * process-wide stats. The global counters are still accumulated regardless. */
 uint32_t topic_hub_publish(topic_hub_t *hub, const char *topic, size_t topic_len,
                         const char *data, size_t len, bool binary,
-                        uint64_t except_id);
+                        uint64_t except_id,
+                        uint64_t *posted_out, uint64_t *dropped_out);
 
 /* Scatter/gather: no global tally exists, so each worker answers with its own
  * match count. SUSPENDS the caller; a worker that misses `timeout_ms` is left
@@ -87,6 +93,50 @@ uint32_t topic_hub_publish(topic_hub_t *hub, const char *topic, size_t topic_len
  * context only. */
 uint32_t topic_hub_count(topic_hub_t *hub, const char *topic, size_t topic_len,
                       uint32_t timeout_ms);
+
+/* -------------------------------------------------------------- reliable send
+ *
+ * `publish()` above is best-effort: a full target mailbox drops the copy. The
+ * two calls below never drop silently — a full target is PARKED on a bounded
+ * per-worker outbound queue and retried by a reactor timer until it lands or
+ * `timeout_ms` passes. Flow control is between the sender and this queue (its
+ * cap), never between the sender and the slowest consumer (the NATS model). See
+ * docs/PLAN_RELIABLE_ROOM_PUBLISH.md.
+ *
+ * `queue_max`/`interval_ms`/`timeout_ms` come from HttpServerConfig; the hub
+ * holds no config of its own. The local delivery (this worker's own tree) is
+ * done synchronously first, exactly as publish() does.
+ */
+
+typedef enum {
+    TOPIC_HUB_SEND_OK = 0,      /* delivered to every target (delivered = count) */
+    TOPIC_HUB_SEND_QUEUE_FULL,  /* outbound queue at cap; nothing parked */
+    TOPIC_HUB_SEND_EXPIRED,     /* deadline passed with a target still full */
+    TOPIC_HUB_SEND_NO_CONTEXT,  /* blocking send() called with no coroutine to park */
+    TOPIC_HUB_SEND_NO_QUEUE,    /* thread never attached — no outbound queue to retry on */
+    TOPIC_HUB_SEND_SHUTDOWN,    /* the worker detached while the send was parked */
+} topic_hub_send_status_t;
+
+typedef struct {
+    topic_hub_send_status_t status;
+    uint32_t                delivered;   /* targets the message reached */
+    uint32_t                pending;     /* targets still unfilled at give-up */
+} topic_hub_send_result_t;
+
+/* Non-blocking: fan out, park full targets, return at once. `true` = delivered
+ * or parked; `false` = the outbound queue is at `queue_max` and nothing was
+ * parked (counted retry_rejected). Any thread; never suspends. */
+bool topic_hub_try_send(topic_hub_t *hub, const char *topic, size_t topic_len,
+                        const char *data, size_t len, bool binary, uint64_t except_id,
+                        uint32_t timeout_ms, uint32_t interval_ms, uint32_t queue_max);
+
+/* Blocking: fan out, park full targets, then SUSPEND the calling coroutine until
+ * every target lands or the deadline passes. Coroutine context only — with no
+ * coroutine it returns TOPIC_HUB_SEND_NO_CONTEXT rather than degrading to
+ * best-effort (the caller chose the reliable path). */
+topic_hub_send_result_t topic_hub_send(topic_hub_t *hub, const char *topic, size_t topic_len,
+                        const char *data, size_t len, bool binary, uint64_t except_id,
+                        uint32_t timeout_ms, uint32_t interval_ms, uint32_t queue_max);
 
 /* Process-wide since start, for HttpServer::getRuntimeStats(). */
 typedef struct {
@@ -103,6 +153,34 @@ typedef struct {
      * is data loss: a worker is not draining fast enough, or a publisher is
      * running without setWsPublishRateLimit(). */
     uint64_t dropped;
+
+    /* --- reliable send (topic_hub_send / topic_hub_try_send) ---------------
+     * The best-effort `dropped` above is never conflated with these: a full
+     * mailbox on the reliable path is PARKED, not lost, and only these count. */
+
+    /* Full targets parked on the sender-side outbound queue for retry. */
+    uint64_t retry_queued;
+
+    /* Parked targets a later retry got into the mailbox. */
+    uint64_t retry_delivered;
+
+    /* Parked targets dropped because their deadline passed with the mailbox
+     * still full — the only reliable-path loss, and it is bounded and reported. */
+    uint64_t retry_expired;
+
+    /* Reliable sends refused at enqueue because the outbound queue was at its
+     * cap (setWsPublishRetryQueueMax). trySend() returned false / send() threw;
+     * nothing was parked. */
+    uint64_t retry_rejected;
+
+    /* Parked targets dropped because the target worker had detached (its inbox
+     * gone or its slot reused) — delivering would have been a mis-delivery. */
+    uint64_t retry_gone;
+
+    /* Parked targets abandoned because THIS worker detached while they were still
+     * in flight — a clean-shutdown loss, distinct from a deadline `retry_expired`
+     * so a shutdown is never mislabelled a timeout. */
+    uint64_t retry_shutdown;
 } topic_hub_stats_t;
 
 void topic_hub_get_stats(topic_hub_t *hub, topic_hub_stats_t *out);

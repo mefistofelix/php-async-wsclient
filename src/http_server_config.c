@@ -96,6 +96,9 @@ struct _http_server_shared_config_t {
     uint32_t                ws_max_subscriptions;
     uint32_t                ws_publish_rate;
     uint32_t                ws_publish_burst;
+    uint32_t                ws_publish_retry_interval_ms;
+    uint32_t                ws_publish_retry_timeout_ms;
+    uint32_t                ws_publish_retry_queue_max;
     bool                    ws_permessage_deflate;
 
     /* Compression — see http_server_config_t for semantics. The MIME
@@ -194,6 +197,9 @@ static void http_server_config_populate_from_shared(
 #define DEFAULT_WS_MAX_FRAME_SIZE       (1u * 1024u * 1024u)   /* 1 MiB */
 #define DEFAULT_WS_PING_INTERVAL_MS     30000u
 #define DEFAULT_WS_PONG_TIMEOUT_MS      60000u
+#define DEFAULT_WS_PUBLISH_RETRY_INTERVAL_MS  50u
+#define DEFAULT_WS_PUBLISH_RETRY_TIMEOUT_MS   5000u
+#define DEFAULT_WS_PUBLISH_RETRY_QUEUE_MAX    4096u
 #define WS_MAX_MESSAGE_SIZE_MIN         128u
 #define WS_MAX_MESSAGE_SIZE_MAX         (256u * 1024u * 1024u) /* 256 MiB hard cap */
 
@@ -456,6 +462,9 @@ ZEND_METHOD(TrueAsync_HttpServerConfig, __construct)
     config->ws_max_subscriptions = 0;   /* unlimited — the application decides */
     config->ws_publish_rate      = 0;   /* off — see setWsPublishRateLimit */
     config->ws_publish_burst     = 0;
+    config->ws_publish_retry_interval_ms = DEFAULT_WS_PUBLISH_RETRY_INTERVAL_MS;
+    config->ws_publish_retry_timeout_ms  = DEFAULT_WS_PUBLISH_RETRY_TIMEOUT_MS;
+    config->ws_publish_retry_queue_max   = DEFAULT_WS_PUBLISH_RETRY_QUEUE_MAX;
     config->ws_permessage_deflate = false;
     config->http3_alt_svc_enabled = true;  /* RFC 7838 advertise on by default */
     config->http3_pacing = false;          /* QUIC send pacing — opt-in (#59) */
@@ -1567,6 +1576,78 @@ ZEND_METHOD(TrueAsync_HttpServerConfig, getWsPublishBurst)
 {
     ZEND_PARSE_PARAMETERS_NONE();
     RETURN_LONG((zend_long)Z_HTTP_SERVER_CONFIG_P(ZEND_THIS)->ws_publish_burst);
+}
+
+/* proto HttpServerConfig::setWsPublishRetryIntervalMs(int $ms): static
+ * Drainer cadence for reliable room-sends (Room::send/trySend). Default 50. */
+ZEND_METHOD(TrueAsync_HttpServerConfig, setWsPublishRetryIntervalMs)
+{
+    zend_long ms;
+    ZEND_PARSE_PARAMETERS_START(1, 1) Z_PARAM_LONG(ms) ZEND_PARSE_PARAMETERS_END();
+    http_server_config_t *config = Z_HTTP_SERVER_CONFIG_P(ZEND_THIS);
+    if (config_check_locked(config)) { return; }
+    if (ms <= 0 || (zend_ulong)ms > UINT32_MAX) {
+        zend_throw_exception(http_server_invalid_argument_exception_ce,
+            "WsPublishRetryIntervalMs must be a positive number of milliseconds", 0);
+        return;
+    }
+    config->ws_publish_retry_interval_ms = (uint32_t)ms;
+    RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
+}
+
+/* proto HttpServerConfig::getWsPublishRetryIntervalMs(): int */
+ZEND_METHOD(TrueAsync_HttpServerConfig, getWsPublishRetryIntervalMs)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_LONG((zend_long)Z_HTTP_SERVER_CONFIG_P(ZEND_THIS)->ws_publish_retry_interval_ms);
+}
+
+/* proto HttpServerConfig::setWsPublishRetryTimeoutMs(int $ms): static
+ * Default reliable-send deadline; a per-call timeoutMs overrides. Default 5000. */
+ZEND_METHOD(TrueAsync_HttpServerConfig, setWsPublishRetryTimeoutMs)
+{
+    zend_long ms;
+    ZEND_PARSE_PARAMETERS_START(1, 1) Z_PARAM_LONG(ms) ZEND_PARSE_PARAMETERS_END();
+    http_server_config_t *config = Z_HTTP_SERVER_CONFIG_P(ZEND_THIS);
+    if (config_check_locked(config)) { return; }
+    if (ms <= 0 || (zend_ulong)ms > UINT32_MAX) {
+        zend_throw_exception(http_server_invalid_argument_exception_ce,
+            "WsPublishRetryTimeoutMs must be a positive number of milliseconds", 0);
+        return;
+    }
+    config->ws_publish_retry_timeout_ms = (uint32_t)ms;
+    RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
+}
+
+/* proto HttpServerConfig::getWsPublishRetryTimeoutMs(): int */
+ZEND_METHOD(TrueAsync_HttpServerConfig, getWsPublishRetryTimeoutMs)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_LONG((zend_long)Z_HTTP_SERVER_CONFIG_P(ZEND_THIS)->ws_publish_retry_timeout_ms);
+}
+
+/* proto HttpServerConfig::setWsPublishRetryQueueMax(int $count): static
+ * Per-worker outbound queue cap in ENTRIES (one entry per message). Default 4096. */
+ZEND_METHOD(TrueAsync_HttpServerConfig, setWsPublishRetryQueueMax)
+{
+    zend_long count;
+    ZEND_PARSE_PARAMETERS_START(1, 1) Z_PARAM_LONG(count) ZEND_PARSE_PARAMETERS_END();
+    http_server_config_t *config = Z_HTTP_SERVER_CONFIG_P(ZEND_THIS);
+    if (config_check_locked(config)) { return; }
+    if (count <= 0 || (zend_ulong)count > UINT32_MAX) {
+        zend_throw_exception(http_server_invalid_argument_exception_ce,
+            "WsPublishRetryQueueMax must be a positive number of entries", 0);
+        return;
+    }
+    config->ws_publish_retry_queue_max = (uint32_t)count;
+    RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
+}
+
+/* proto HttpServerConfig::getWsPublishRetryQueueMax(): int */
+ZEND_METHOD(TrueAsync_HttpServerConfig, getWsPublishRetryQueueMax)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_LONG((zend_long)Z_HTTP_SERVER_CONFIG_P(ZEND_THIS)->ws_publish_retry_queue_max);
 }
 
 /* proto HttpServerConfig::setWsPingIntervalMs(int $ms): static
@@ -3114,6 +3195,9 @@ static zend_object *http_server_config_create(zend_class_entry *ce)
     config->ws_max_subscriptions         = 0;
     config->ws_publish_rate              = 0;
     config->ws_publish_burst             = 0;
+    config->ws_publish_retry_interval_ms = 0;
+    config->ws_publish_retry_timeout_ms  = 0;
+    config->ws_publish_retry_queue_max   = 0;
     config->ws_ping_interval_ms          = 0;
     config->ws_pong_timeout_ms           = 0;
     config->ws_permessage_deflate        = false;
@@ -3289,6 +3373,9 @@ static http_server_shared_config_t *http_server_shared_config_freeze(
     shared->ws_max_subscriptions         = src->ws_max_subscriptions;
     shared->ws_publish_rate              = src->ws_publish_rate;
     shared->ws_publish_burst             = src->ws_publish_burst;
+    shared->ws_publish_retry_interval_ms = src->ws_publish_retry_interval_ms;
+    shared->ws_publish_retry_timeout_ms  = src->ws_publish_retry_timeout_ms;
+    shared->ws_publish_retry_queue_max   = src->ws_publish_retry_queue_max;
     shared->ws_ping_interval_ms          = src->ws_ping_interval_ms;
     shared->ws_pong_timeout_ms           = src->ws_pong_timeout_ms;
     shared->ws_permessage_deflate        = src->ws_permessage_deflate;
@@ -3526,6 +3613,9 @@ static void http_server_config_populate_from_shared(
     dst->ws_max_subscriptions         = src->ws_max_subscriptions;
     dst->ws_publish_rate              = src->ws_publish_rate;
     dst->ws_publish_burst             = src->ws_publish_burst;
+    dst->ws_publish_retry_interval_ms = src->ws_publish_retry_interval_ms;
+    dst->ws_publish_retry_timeout_ms  = src->ws_publish_retry_timeout_ms;
+    dst->ws_publish_retry_queue_max   = src->ws_publish_retry_queue_max;
     dst->ws_ping_interval_ms          = src->ws_ping_interval_ms;
     dst->ws_pong_timeout_ms           = src->ws_pong_timeout_ms;
     dst->ws_permessage_deflate        = src->ws_permessage_deflate;

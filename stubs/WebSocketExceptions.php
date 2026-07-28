@@ -52,3 +52,25 @@ final class WebSocketBackpressureException extends WebSocketException
 final class WebSocketConcurrentReadException extends WebSocketException
 {
 }
+
+/**
+ * Reliable room delivery ({@see Room::send()} / {@see HttpServer::send()})
+ * failed: the retry deadline passed with a target mailbox still full, the
+ * outbound queue was at its cap, or send() was called outside a coroutine.
+ *
+ * DISTINCT from {@see WebSocketBackpressureException} (a rate-limiter trip where
+ * nothing was sent): a delivery failure is at-least-once with partial delivery —
+ * the fast targets were posted during fan-out, before any failure verdict. The
+ * counts say how much landed, so re-sending (which duplicates on the ones that
+ * already got it) is a decision, not an accident.
+ *
+ * @strict-properties
+ */
+final class RoomDeliveryException extends WebSocketException
+{
+    /** Targets the message was delivered to before the failure. */
+    public readonly int $delivered;
+
+    /** Targets still unfilled when the send gave up. */
+    public readonly int $pending;
+}

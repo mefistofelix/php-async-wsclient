@@ -36,6 +36,7 @@ zend_class_entry *websocket_exception_ce                = NULL;
 zend_class_entry *websocket_closed_exception_ce         = NULL;
 zend_class_entry *websocket_backpressure_exception_ce   = NULL;
 zend_class_entry *websocket_concurrent_read_exception_ce = NULL;
+zend_class_entry *room_delivery_exception_ce            = NULL;
 
 /* http_server_exception_ce — base of the WebSocketException hierarchy.
  * Defined in http_server_exceptions.c, registered before us at MINIT. */
@@ -1235,7 +1236,8 @@ static void ws_do_publish(INTERNAL_FUNCTION_PARAMETERS, const bool binary)
 
     const uint32_t sent = topic_hub_publish(ws_topic_hub_of(w),
         ZSTR_VAL(topic), ZSTR_LEN(topic),
-        ZSTR_VAL(data), ZSTR_LEN(data), binary, except_id);
+        ZSTR_VAL(data), ZSTR_LEN(data), binary, except_id,
+        /* posted_out */ NULL, /* dropped_out */ NULL);
 
     RETURN_LONG((zend_long) sent);
 }
@@ -1350,4 +1352,6 @@ void ws_php_classes_register(void)
         register_class_TrueAsync_WebSocketBackpressureException(websocket_exception_ce);
     websocket_concurrent_read_exception_ce =
         register_class_TrueAsync_WebSocketConcurrentReadException(websocket_exception_ce);
+    room_delivery_exception_ce =
+        register_class_TrueAsync_RoomDeliveryException(websocket_exception_ce);
 }

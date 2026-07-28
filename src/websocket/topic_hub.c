@@ -40,6 +40,16 @@ struct topic_hub_s {
     zend_atomic_int64 skipped;
     zend_atomic_int64 dropped;
 
+    /* Reliable-send (topic_hub_send / topic_hub_try_send) counters. Kept apart
+     * from `dropped`, which is best-effort loss only: a full mailbox on the
+     * reliable path is parked here, never conflated with a drop. */
+    zend_atomic_int64 retry_queued;      /* targets parked for retry */
+    zend_atomic_int64 retry_delivered;   /* parked targets a retry landed */
+    zend_atomic_int64 retry_expired;     /* parked targets dropped at deadline */
+    zend_atomic_int64 retry_rejected;    /* sends refused — outbound queue at cap */
+    zend_atomic_int64 retry_gone;        /* parked targets whose worker had detached */
+    zend_atomic_int64 retry_shutdown;    /* parked targets abandoned by THIS worker's detach */
+
     thread_mailbox_t *inbox[TOPIC_HUB_MAX_WORKERS];
     /* Bumped on every attach. A worker that detaches frees its slot for reuse,
      * so a reply in flight must check the generation or it lands on the wrong
@@ -95,6 +105,47 @@ typedef struct {
     char          topic[1];
 } ws_cmd_t;
 
+/* One still-unfilled destination in a parked reliable send: the target worker's
+ * slot plus the generation it was claimed with. The generation is the proof of
+ * life — a slot reused by a fresh worker bumps its generation, so a retry on a
+ * stale generation is a mis-delivery to be dropped (retry_gone), not delivered. */
+typedef struct {
+    int      slot;
+    uint32_t gen;
+} retry_target_t;
+
+/* One parked reliable-send message on a worker's outbound queue. Ownership is
+ * cloned from ws_query_t (same early-resume / cancel hazards): a blocking send()
+ * holds `refcount` across ZEND_ASYNC_SUSPEND and reads delivered/npending from
+ * this struct AFTER resume, so the drainer must not free it out from under the
+ * sleeper. The queue holds the other reference; the last release frees.
+ *
+ * The topic rides inline because each retry rebuilds a fresh ws_cmd_t (the topic
+ * is matched against the target worker's own tree, so it must travel with every
+ * post). `payload` is the shared, refcounted body — the entry owns exactly ONE
+ * payload reference, released once at the terminal step. */
+typedef struct retry_entry_s {
+    struct retry_entry_s *next;
+
+    zend_atomic_int       refcount;    /* caller (send) holds 1 across the park; queue holds 1 */
+    bool                  abandoned;   /* set by whoever resumes/cancels first; the other side skips the fire */
+    bool                  shutdown;    /* set by detach teardown so a woken send() reports SHUTDOWN, not a false timeout */
+
+    ws_payload_t         *payload;     /* shared body — the entry owns one ref */
+    retry_target_t       *pending;     /* npending still-unfilled targets, compacted in place */
+    uint32_t              npending;
+
+    uint32_t              delivered;   /* targets a retry has landed on */
+    uint32_t              gone;         /* targets resolved as detached (mis-delivery avoided) */
+
+    uint64_t              except_id;   /* the publish's origin, excluded on the far tree */
+    uint64_t              deadline_ms; /* ZEND_ASYNC_NOW() ms; the DRAINER owns this deadline */
+    zend_async_event_t   *waiter;      /* non-NULL only for a blocking send(); the caller disposes it */
+
+    size_t                topic_len;
+    char                  topic[1];    /* inline — rebuilt into each retry's ws_cmd_t */
+} retry_entry_t;
+
 /* This thread's attachment to ONE hub. */
 typedef struct ws_local_s {
     struct ws_local_s *next;
@@ -103,7 +154,35 @@ typedef struct ws_local_s {
     uint32_t           gen;
     thread_mailbox_t  *inbox;
     ws_topic_tree_t   *tree;
+
+    /* Reliable-send outbound queue — thread-local, so NO lock: enqueued by this
+     * worker's coroutines, drained by this worker's timer, torn down by this
+     * worker's detach, all one thread. The bound (`retry_count` vs queue_max)
+     * counts ENTRIES: one entry is one message, parked atomically. */
+    retry_entry_t     *retry_head;
+    retry_entry_t     *retry_tail;
+    uint32_t           retry_count;
+    uint32_t           retry_interval_ms;   /* drainer cadence, fixed at the first arm */
+
+    /* ONE reused MULTISHOT timer (the deadline_tick model), created lazily on the
+     * first enqueue and kept for the worker's life. A one-shot would have to be
+     * re-created every tick, and the engine does NOT free a fired one-shot's event
+     * (on_timer_event only stops it) — re-arming would leak a timer handle per
+     * tick. So we START this one when the queue goes non-empty, STOP it (keeping the
+     * handle) when the queue drains, and dispose it exactly once at detach. `armed`
+     * tracks whether it is currently running. */
+    zend_async_event_t          *retry_timer;
+    zend_async_event_callback_t *retry_timer_cb;
+    bool                         retry_timer_armed;
 } ws_local_t;
+
+/* The drainer timer's callback carries the hub so the tick can re-resolve this
+ * thread's ws_local_t (via ws_local_of) — never a raw ws_local_t*, which detach
+ * may have freed. */
+typedef struct {
+    zend_async_event_callback_t base;
+    topic_hub_t                *hub;
+} retry_cb_t;
 
 /* Keyed by hub, not one-per-thread: a topic tree is per-SERVER state, and
  * CODING_STANDARDS §1.2 keeps per-server state out of thread-globals. One
@@ -149,6 +228,13 @@ void topic_hub_get_stats(topic_hub_t *hub, topic_hub_stats_t *out)
     out->posted  = (uint64_t) zend_atomic_int64_load(&hub->posted);
     out->skipped = (uint64_t) zend_atomic_int64_load(&hub->skipped);
     out->dropped = (uint64_t) zend_atomic_int64_load(&hub->dropped);
+
+    out->retry_queued    = (uint64_t) zend_atomic_int64_load(&hub->retry_queued);
+    out->retry_delivered = (uint64_t) zend_atomic_int64_load(&hub->retry_delivered);
+    out->retry_expired   = (uint64_t) zend_atomic_int64_load(&hub->retry_expired);
+    out->retry_rejected  = (uint64_t) zend_atomic_int64_load(&hub->retry_rejected);
+    out->retry_gone      = (uint64_t) zend_atomic_int64_load(&hub->retry_gone);
+    out->retry_shutdown  = (uint64_t) zend_atomic_int64_load(&hub->retry_shutdown);
 }
 
 static ws_payload_t *ws_payload_new(const char *data, const size_t len, const bool binary)
@@ -200,6 +286,12 @@ topic_hub_t *topic_hub_create(void)
     ZEND_ATOMIC_INT64_INIT(&hub->posted, 0);
     ZEND_ATOMIC_INT64_INIT(&hub->skipped, 0);
     ZEND_ATOMIC_INT64_INIT(&hub->dropped, 0);
+    ZEND_ATOMIC_INT64_INIT(&hub->retry_queued, 0);
+    ZEND_ATOMIC_INT64_INIT(&hub->retry_delivered, 0);
+    ZEND_ATOMIC_INT64_INIT(&hub->retry_expired, 0);
+    ZEND_ATOMIC_INT64_INIT(&hub->retry_rejected, 0);
+    ZEND_ATOMIC_INT64_INIT(&hub->retry_gone, 0);
+    ZEND_ATOMIC_INT64_INIT(&hub->retry_shutdown, 0);
 
     hub->admin = tsrm_mutex_alloc();
 
@@ -346,6 +438,10 @@ static bool topic_hub_post_locked(topic_hub_t *hub, const int slot, ws_cmd_t *cm
 
 static void topic_hub_drain(void **items, const size_t count, void *arg);
 
+/* Reliable-send teardown, defined with the rest of the outbound-queue machinery
+ * at the foot of the file; detach (above them) needs it. */
+static void topic_hub_retry_teardown(topic_hub_t *hub, ws_local_t *local);
+
 int topic_hub_attach(topic_hub_t *hub)
 {
     if (hub == NULL || ws_local_of(hub) != NULL) {
@@ -432,6 +528,14 @@ void topic_hub_detach(topic_hub_t *hub)
      * below can tear a session down and unsubscribe it; hub->interest[slot] is
      * NULL now, so those decrements land nowhere — which is what we want. */
     pefree(counters, 1);
+
+    /* Tear the outbound retry queue down BEFORE the tree/attachment go: it stops
+     * the drainer timer (so no tick starts mid-teardown) and wakes every parked
+     * send() with a shutdown outcome, so a blocking caller throws rather than
+     * hanging on a queue that is about to vanish. Runs on this same thread, so a
+     * woken coroutine resumes only after we return — and its entry refcount keeps
+     * the struct alive until it does. */
+    topic_hub_retry_teardown(hub, local);
 
     /* The slot is retired, so no producer can post any more. Whatever is still
      * queued holds payload/query references and thread_mailbox_free throws the
@@ -535,41 +639,45 @@ static void topic_hub_drain(void **items, const size_t count, void *arg)
 
 /* --------------------------------------------------------------- publish */
 
-uint32_t topic_hub_publish(topic_hub_t *hub, const char *topic, const size_t topic_len,
-                        const char *data, const size_t len, const bool binary,
-                        const uint64_t except_id)
+/* The shared locked slot walk behind publish() AND the reliable sends. There is
+ * exactly one copy of the fan-out; the only thing that varies is what a FULL
+ * mailbox means:
+ *
+ *   full != NULL (reliable send): the full target is appended to full[] as a
+ *     {slot,gen} pair to park for retry — nothing is dropped;
+ *   full == NULL (best-effort publish): the full target drops the copy and is
+ *     tallied in *dropped_out.
+ *
+ * The payload is built lazily on the first real post (through *payload_io), so a
+ * fan-out that interest-skips every other worker allocates nothing. Every
+ * successful post takes a fresh +1 on the payload because the consumer's drain
+ * unconditionally releases it (topic_hub_drain, WS_CMD_PUBLISH) — the
+ * +1-before-post / -1-on-fail discipline. The generation is read HERE, under
+ * admin, so a parked target can later tell a live worker from a reused slot.
+ *
+ * Caller MUST hold hub->admin. Returns mailboxes that accepted the copy. */
+static uint32_t topic_hub_fanout_locked(topic_hub_t *hub, const ws_local_t *local,
+        const char *topic, const size_t topic_len,
+        const char *data, const size_t len, const bool binary, const uint64_t except_id,
+        const ws_interest_t *interest, ws_payload_t **payload_io,
+        retry_target_t *full, uint32_t *nfull,
+        uint64_t *skipped_out, uint64_t *dropped_out)
 {
-    if (hub == NULL) {
-        return 0;
-    }
-
-    const ws_local_t *const local = ws_local_of(hub);
-
-    const uint32_t sent = local != NULL
-        ? ws_topic_publish(local->tree, topic, topic_len, data, len, binary, except_id)
-        : 0;
-
-    ws_interest_t interest;
-    ws_interest_build(&interest, topic, topic_len);
-
-    tsrm_mutex_lock(hub->admin);
-
-    ws_payload_t *payload  = NULL;
-    uint64_t      posted   = 0;
-    uint64_t      skipped  = 0;
+    ws_payload_t *payload = *payload_io;
+    uint32_t      posted  = 0;
+    uint64_t      skipped = 0;
+    uint64_t      dropped = 0;
 
     for (int slot = 0; slot < hub->slots_used; slot++) {
         if (hub->inbox[slot] == NULL || (local != NULL && slot == local->slot)) {
             continue;
         }
 
-        if (!ws_interest_matches(hub, slot, &interest)) {
+        if (!ws_interest_matches(hub, slot, interest)) {
             skipped++;
             continue;
         }
 
-        /* One copy for the whole fan-out, refcounted — and none at all when every
-         * other worker was skipped. */
         if (payload == NULL) {
             payload = ws_payload_new(data, len, binary);
         }
@@ -585,18 +693,63 @@ uint32_t topic_hub_publish(topic_hub_t *hub, const char *topic, const size_t top
         } else {
             ws_payload_release(payload);
             pefree(cmd, 1);
-            topic_hub_note_drop(hub);
+
+            if (full != NULL) {
+                full[*nfull].slot = slot;
+                full[*nfull].gen  = hub->gen[slot];
+                (*nfull)++;
+            } else {
+                dropped++;
+            }
         }
     }
 
+    *payload_io  = payload;
+    *skipped_out = skipped;
+    *dropped_out = dropped;
+    return posted;
+}
+
+uint32_t topic_hub_publish(topic_hub_t *hub, const char *topic, const size_t topic_len,
+                        const char *data, const size_t len, const bool binary,
+                        const uint64_t except_id,
+                        uint64_t *posted_out, uint64_t *dropped_out)
+{
+    if (hub == NULL) {
+        if (posted_out  != NULL) *posted_out  = 0;
+        if (dropped_out != NULL) *dropped_out = 0;
+        return 0;
+    }
+
+    const ws_local_t *const local = ws_local_of(hub);
+
+    const uint32_t sent = local != NULL
+        ? ws_topic_publish(local->tree, topic, topic_len, data, len, binary, except_id)
+        : 0;
+
+    ws_interest_t interest;
+    ws_interest_build(&interest, topic, topic_len);
+
+    ws_payload_t *payload = NULL;
+    uint64_t      skipped = 0;
+    uint64_t      dropped = 0;
+
+    tsrm_mutex_lock(hub->admin);
+    const uint32_t posted = topic_hub_fanout_locked(hub, local, topic, topic_len,
+        data, len, binary, except_id, &interest, &payload,
+        /*full*/ NULL, /*nfull*/ NULL, &skipped, &dropped);
     tsrm_mutex_unlock(hub->admin);
 
     (void) ws_atomic_u64_add(&hub->posted,  (int64_t) posted);
     (void) ws_atomic_u64_add(&hub->skipped, (int64_t) skipped);
+    (void) ws_atomic_u64_add(&hub->dropped, (int64_t) dropped);
 
     if (payload != NULL) {
         ws_payload_release(payload);
     }
+
+    if (posted_out  != NULL) *posted_out  = posted;
+    if (dropped_out != NULL) *dropped_out = dropped;
 
     return sent;
 }
@@ -692,4 +845,624 @@ uint32_t topic_hub_count(topic_hub_t *hub, const char *topic, const size_t topic
     ws_query_release(query);
 
     return total;
+}
+
+/* ----------------------------------------------------------- reliable send
+ *
+ * publish() drops a copy into a full mailbox and bumps `dropped`. The two calls
+ * below never drop silently: a full target is parked as a {slot,gen} on this
+ * worker's thread-local outbound queue and retried by a one-shot reactor timer
+ * until it lands, the deadline passes, or the target worker detaches. Flow
+ * control is between the sender and the queue's cap, never between the sender and
+ * the slowest consumer (the NATS model). See docs/PLAN_RELIABLE_ROOM_PUBLISH.md.
+ */
+
+static bool topic_hub_retry_arm(topic_hub_t *hub, ws_local_t *local);
+static void topic_hub_retry_drain(topic_hub_t *hub, ws_local_t *local);
+
+/* Ownership protocol cloned from ws_query_* — same early-resume/cancel hazards. */
+
+static retry_entry_t *retry_entry_new(const char *topic, const size_t topic_len,
+        ws_payload_t *payload, const uint64_t except_id, const uint64_t deadline_ms,
+        const retry_target_t *targets, const uint32_t ntargets, zend_async_event_t *waiter)
+{
+    retry_entry_t *const e = pemalloc(sizeof(*e) + topic_len, 1);
+
+    e->next        = NULL;
+    /* A blocking send() holds a ref across the suspend; the queue always holds
+     * one. trySend has no waiter, so only the queue's ref. */
+    ZEND_ATOMIC_INT_INIT(&e->refcount, waiter != NULL ? 2 : 1);
+    e->abandoned   = false;
+    e->shutdown    = false;
+    e->payload     = payload;       /* the entry takes over the caller's base ref */
+    e->npending    = ntargets;
+    e->pending     = pemalloc((size_t) ntargets * sizeof(retry_target_t), 1);
+    memcpy(e->pending, targets, (size_t) ntargets * sizeof(retry_target_t));
+    e->delivered   = 0;
+    e->gone        = 0;
+    e->except_id   = except_id;
+    e->deadline_ms = deadline_ms;
+    e->waiter      = waiter;
+    e->topic_len   = topic_len;
+
+    if (topic_len != 0) {
+        memcpy(e->topic, topic, topic_len);
+    }
+
+    return e;
+}
+
+/* The last reference frees the entry (never the payload — that is released once at
+ * the terminal step, independent of the refcount). */
+static void retry_entry_release(retry_entry_t *e)
+{
+    if (zend_atomic_int_fetch_add(&e->refcount, -1) == 1) {
+        pefree(e->pending, 1);
+        pefree(e, 1);
+    }
+}
+
+/* Tear down a freshly-built entry that never entered service — its enqueue could
+ * not arm the drainer, so it was unlinked before any other holder saw it. It is
+ * still sole-owned (never shared across a suspend or a post), so releasing the one
+ * payload ref it took and freeing it outright is the whole teardown; the caller
+ * disposes any blocking-send event separately (it created and still holds it). */
+static void retry_entry_discard(retry_entry_t *e)
+{
+    ws_payload_release(e->payload);
+    pefree(e->pending, 1);
+    pefree(e, 1);
+}
+
+/* The terminal step for a resolved entry (all targets delivered/gone, deadline
+ * passed, or the worker detaching). Wake a blocking send() exactly once — clearing
+ * `waiter` before the fire, as count() clears `done` before dispose, so the
+ * resuming caller never sees a stale event — but only when the caller has not
+ * already abandoned it (cancellation). Then drop the one payload reference the
+ * entry owned and the queue's refcount. MUST run outside hub->admin: the fire can
+ * schedule a resume and we hold no lock across it (count()'s discipline). */
+static void retry_entry_finish(retry_entry_t *e)
+{
+    if (e->waiter != NULL && !e->abandoned) {
+        zend_async_event_t *const w = e->waiter;
+        e->waiter = NULL;
+        async_plain_event_fire(w);
+    }
+
+    ws_payload_release(e->payload);
+    retry_entry_release(e);
+}
+
+/* -------------------------------------------------------------- the drainer */
+
+static void topic_hub_retry_cb_dispose(zend_async_event_callback_t *cb,
+                                       zend_async_event_t *event)
+{
+    (void) event;
+    efree(cb);
+}
+
+static void topic_hub_retry_tick_fn(zend_async_event_t *event,
+        zend_async_event_callback_t *callback, void *result, zend_object *exception)
+{
+    (void) event; (void) result;
+
+    retry_cb_t *const  cb    = (retry_cb_t *) callback;
+    topic_hub_t *const hub   = cb->hub;
+    ws_local_t *const  local = ws_local_of(hub);
+
+    if (exception != NULL) {
+        return;   /* loop teardown — the reactor is going away */
+    }
+
+    if (local == NULL) {
+        return;
+    }
+
+    topic_hub_retry_drain(hub, local);
+
+    /* Queue drained — PAUSE the timer (keep the handle for reuse) so an idle worker
+     * pays no periodic wakeup. Safe from inside the callback: stop() only clears the
+     * repeat via uv_timer_stop; the event is not disposed and is re-started by the
+     * next enqueue. */
+    if (local->retry_head == NULL && local->retry_timer != NULL && local->retry_timer_armed) {
+        local->retry_timer->stop(local->retry_timer);
+        local->retry_timer_armed = false;
+    }
+}
+
+/* Make sure the drainer is running. Returns false only on a genuine failure to
+ * create/start the timer — so a caller that MUST have a tick coming (a blocking
+ * send about to suspend with no timeout waker of its own) can refuse instead of
+ * hanging. The MULTISHOT handle is created once and reused; here we (re)start it.
+ * Mirrors pending_post_arm_timer's bool contract and http_server_deadline_tick's
+ * MULTISHOT discipline. */
+static bool topic_hub_retry_arm(topic_hub_t *hub, ws_local_t *local)
+{
+    if (local->retry_timer_armed) {
+        return true;   /* already running */
+    }
+
+    if (local->retry_timer == NULL) {
+        const zend_ulong ms = local->retry_interval_ms != 0 ? local->retry_interval_ms : 50;
+
+        /* Periodic MULTISHOT: the reactor does NOT close it on fire, so one handle
+         * serves every tick and we own its single dispose() at detach. */
+        zend_async_timer_event_t *const t =
+            ZEND_ASYNC_NEW_TIMER_EVENT(ms, /*periodic*/ true);
+
+        if (UNEXPECTED(t == NULL)) {
+            zend_clear_exception();
+            return false;
+        }
+
+        ZEND_ASYNC_TIMER_SET_MULTISHOT(t);
+
+        retry_cb_t *const cb = (retry_cb_t *)
+            ZEND_ASYNC_EVENT_CALLBACK_EX(topic_hub_retry_tick_fn, sizeof(*cb));
+
+        if (UNEXPECTED(cb == NULL)) {
+            t->base.dispose(&t->base);
+            return false;
+        }
+
+        cb->base.dispose = topic_hub_retry_cb_dispose;
+        cb->hub          = hub;
+
+        if (UNEXPECTED(!t->base.add_callback(&t->base, &cb->base))) {
+            efree(cb);
+            t->base.dispose(&t->base);
+            return false;
+        }
+
+        local->retry_timer    = &t->base;
+        local->retry_timer_cb = &cb->base;
+    }
+
+    if (UNEXPECTED(!local->retry_timer->start(local->retry_timer))) {
+        return false;
+    }
+
+    local->retry_timer_armed = true;
+    return true;
+}
+
+/* Detach-time teardown of the single reused timer. Stop it (if running) then
+ * dispose once — dispose() frees the callbacks and schedules uv_close on a later
+ * loop turn (libuv forbids a synchronous free of a live handle). */
+static void topic_hub_retry_timer_dispose(ws_local_t *local)
+{
+    if (local->retry_timer == NULL) {
+        return;
+    }
+
+    if (local->retry_timer_armed) {
+        local->retry_timer->stop(local->retry_timer);
+        local->retry_timer_armed = false;
+    }
+
+    local->retry_timer->dispose(local->retry_timer);
+    local->retry_timer    = NULL;
+    local->retry_timer_cb = NULL;
+}
+
+/* One tick: take hub->admin ONCE for the whole walk (the walk never suspends, so
+ * one hold per tick rather than entries×targets acquisitions), resolve every
+ * pending target, and unlink the entries that finished. Finishing (which fires a
+ * waiter) is deferred to AFTER the unlock so no resume is scheduled under the
+ * lock. */
+static void topic_hub_retry_drain(topic_hub_t *hub, ws_local_t *local)
+{
+    const uint64_t now = ZEND_ASYNC_NOW();
+
+    uint64_t delivered = 0;
+    uint64_t gone      = 0;
+    uint64_t expired   = 0;
+
+    retry_entry_t *resolved = NULL;   /* finished this tick; ->next reused as its link */
+
+    tsrm_mutex_lock(hub->admin);
+
+    retry_entry_t *prev = NULL;
+    retry_entry_t *e    = local->retry_head;
+
+    while (e != NULL) {
+        retry_entry_t *const next = e->next;
+
+        /* Compact the pending set in place: landed or gone targets are removed,
+         * a still-full one is kept at the front for the next tick. */
+        uint32_t keep = 0;
+
+        for (uint32_t r = 0; r < e->npending; r++) {
+            const int      slot = e->pending[r].slot;
+            const uint32_t gen  = e->pending[r].gen;
+
+            /* detach nulls the inbox but does NOT bump gen, so a matching gen is
+             * not proof of life — the null inbox is. Either way the worker we
+             * parked for is gone; posting into a reused slot would mis-deliver. */
+            if (hub->inbox[slot] == NULL || hub->gen[slot] != gen) {
+                e->gone++;
+                gone++;
+                continue;
+            }
+
+            ws_cmd_t *const cmd = ws_cmd_new(WS_CMD_PUBLISH, e->topic, e->topic_len);
+            cmd->payload   = e->payload;
+            cmd->except_id = e->except_id;
+
+            /* +1 before the post; the consumer's drain unconditionally releases
+             * it (topic_hub_drain), so a failed post must -1. */
+            zend_atomic_int_fetch_add(&e->payload->refcount, 1);
+
+            if (topic_hub_post_locked(hub, slot, cmd)) {
+                e->delivered++;
+                delivered++;
+            } else {
+                ws_payload_release(e->payload);
+                pefree(cmd, 1);
+                e->pending[keep++] = e->pending[r];   /* still full — keep */
+            }
+        }
+
+        e->npending = keep;
+
+        const bool done = (e->npending == 0);
+        const bool exp  = (!done && now >= e->deadline_ms);
+
+        if (done || exp) {
+            if (exp) {
+                expired += e->npending;   /* the still-full remainder is the reported loss */
+            }
+
+            if (prev != NULL) {
+                prev->next = next;
+            } else {
+                local->retry_head = next;
+            }
+
+            if (local->retry_tail == e) {
+                local->retry_tail = prev;
+            }
+
+            local->retry_count--;
+
+            e->next  = resolved;   /* park for the post-unlock finish */
+            resolved = e;
+            /* prev unchanged — e is gone from the live list */
+        } else {
+            prev = e;
+        }
+
+        e = next;
+    }
+
+    tsrm_mutex_unlock(hub->admin);
+
+    /* Fire waiters and release refs with the lock dropped. */
+    while (resolved != NULL) {
+        retry_entry_t *const n = resolved->next;
+        retry_entry_finish(resolved);
+        resolved = n;
+    }
+
+    if (delivered != 0) (void) ws_atomic_u64_add(&hub->retry_delivered, (int64_t) delivered);
+    if (gone      != 0) (void) ws_atomic_u64_add(&hub->retry_gone,      (int64_t) gone);
+    if (expired   != 0) (void) ws_atomic_u64_add(&hub->retry_expired,   (int64_t) expired);
+
+    /* The tick's caller pauses the timer when this leaves the queue empty. */
+}
+
+/* Detach teardown (called from topic_hub_detach, off hub->admin). Stop the timer
+ * first so no tick starts, then finish every parked entry: a blocking send() is
+ * woken (→ throws on shutdown rather than hanging), the payload and queue refs are
+ * dropped. A send() that has not resumed yet is protected by its own entry
+ * refcount, so its post-resume read of the struct is still valid. */
+static void topic_hub_retry_teardown(topic_hub_t *hub, ws_local_t *local)
+{
+    topic_hub_retry_timer_dispose(local);
+
+    retry_entry_t *e    = local->retry_head;
+    uint64_t       lost = 0;
+
+    while (e != NULL) {
+        retry_entry_t *const next = e->next;
+
+        lost += e->npending;
+        e->shutdown = true;      /* a woken send() reports SHUTDOWN, not a false timeout */
+        retry_entry_finish(e);   /* fires the waiter iff still live and not abandoned */
+
+        e = next;
+    }
+
+    local->retry_head        = NULL;
+    local->retry_tail        = NULL;
+    local->retry_count       = 0;
+    local->retry_interval_ms = 0;   /* queue is gone — let a future attach re-clock */
+
+    if (lost != 0) {
+        /* Clean-shutdown loss — charged to its own counter, never to retry_expired
+         * (a deadline miss), so a shutdown is never read as a timeout. */
+        (void) ws_atomic_u64_add(&hub->retry_shutdown, (int64_t) lost);
+    }
+}
+
+/* Append one atomic entry to the outbound queue and make sure the drainer is
+ * armed. Thread-local, so no lock. Returns false if the drainer could not be
+ * armed — the entry is then unlinked and the queue restored exactly as it was, so
+ * the caller can refuse the send rather than park behind a timer that will never
+ * tick (pending_post_defer's discipline). */
+static bool topic_hub_retry_enqueue(topic_hub_t *hub, ws_local_t *local,
+                                    retry_entry_t *e, const uint32_t interval_ms)
+{
+    retry_entry_t *const prev_tail     = local->retry_tail;
+    const uint32_t       prev_interval = local->retry_interval_ms;
+
+    e->next = NULL;
+
+    if (prev_tail != NULL) {
+        prev_tail->next = e;
+    } else {
+        local->retry_head = e;
+    }
+
+    local->retry_tail = e;
+    local->retry_count++;
+
+    /* The very first enqueue fixes the drainer cadence for the worker's life: the
+     * MULTISHOT timer is created once at that interval and only paused/resumed
+     * thereafter, never re-clocked (a per-call interval on a later send is ignored —
+     * documented first-wins). */
+    if (local->retry_interval_ms == 0) {
+        local->retry_interval_ms = interval_ms != 0 ? interval_ms : 50;
+    }
+
+    if (UNEXPECTED(!topic_hub_retry_arm(hub, local))) {
+        /* Undo the append — restore head/tail/count/cadence to the prior state. */
+        if (prev_tail != NULL) {
+            prev_tail->next = NULL;
+        } else {
+            local->retry_head = NULL;
+        }
+
+        local->retry_tail        = prev_tail;
+        local->retry_count--;
+        local->retry_interval_ms = prev_interval;
+        return false;
+    }
+
+    return true;
+}
+
+/* The fan-out common to both reliable calls: local tree first (like publish),
+ * then the locked slot walk collecting full targets into `full`. Returns posted
+ * count; fills *nfull and *payload (base ref transferred to the caller). */
+static uint32_t topic_hub_send_fanout(topic_hub_t *hub, const ws_local_t *local,
+        const char *topic, const size_t topic_len,
+        const char *data, const size_t len, const bool binary, const uint64_t except_id,
+        retry_target_t *full, uint32_t *nfull, ws_payload_t **payload)
+{
+    if (local != NULL) {
+        (void) ws_topic_publish(local->tree, topic, topic_len, data, len, binary, except_id);
+    }
+
+    ws_interest_t interest;
+    ws_interest_build(&interest, topic, topic_len);
+
+    uint64_t skipped = 0;
+    uint64_t dropped = 0;   /* always 0 on the reliable path — full targets park */
+
+    *payload = NULL;
+    *nfull   = 0;
+
+    tsrm_mutex_lock(hub->admin);
+    const uint32_t posted = topic_hub_fanout_locked(hub, local, topic, topic_len,
+        data, len, binary, except_id, &interest, payload,
+        full, nfull, &skipped, &dropped);
+    tsrm_mutex_unlock(hub->admin);
+
+    (void) ws_atomic_u64_add(&hub->posted,  (int64_t) posted);
+    (void) ws_atomic_u64_add(&hub->skipped, (int64_t) skipped);
+
+    return posted;
+}
+
+bool topic_hub_try_send(topic_hub_t *hub, const char *topic, const size_t topic_len,
+        const char *data, const size_t len, const bool binary, const uint64_t except_id,
+        const uint32_t timeout_ms, const uint32_t interval_ms, const uint32_t queue_max)
+{
+    if (hub == NULL) {
+        return false;
+    }
+
+    ws_local_t *const local = ws_local_of(hub);
+
+    retry_target_t full[TOPIC_HUB_MAX_WORKERS];
+    uint32_t       nfull;
+    ws_payload_t  *payload;
+
+    (void) topic_hub_send_fanout(hub, local, topic, topic_len, data, len, binary,
+                                 except_id, full, &nfull, &payload);
+
+    if (nfull == 0) {
+        /* Delivered outright — no target needed parking. */
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        return true;
+    }
+
+    /* No attachment ⇒ no outbound queue to retry on. Not a queue-full refusal:
+     * there is no queue, so it is not charged to retry_rejected. */
+    if (local == NULL) {
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        return false;
+    }
+
+    /* The cap is checked before we commit the (whole) entry, so the queue is never
+     * half-parked. */
+    if (local->retry_count >= queue_max) {
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        (void) ws_atomic_u64_add(&hub->retry_rejected, 1);
+        return false;
+    }
+
+    retry_entry_t *const e = retry_entry_new(topic, topic_len, payload, except_id,
+        ZEND_ASYNC_NOW() + timeout_ms, full, nfull, /*waiter*/ NULL);
+
+    if (UNEXPECTED(!topic_hub_retry_enqueue(hub, local, e, interval_ms))) {
+        /* Drainer would not arm — nothing is parked, so this is a refusal. */
+        retry_entry_discard(e);
+        (void) ws_atomic_u64_add(&hub->retry_rejected, 1);
+        return false;
+    }
+
+    (void) ws_atomic_u64_add(&hub->retry_queued, (int64_t) nfull);
+
+    return true;
+}
+
+topic_hub_send_result_t topic_hub_send(topic_hub_t *hub, const char *topic, const size_t topic_len,
+        const char *data, const size_t len, const bool binary, const uint64_t except_id,
+        const uint32_t timeout_ms, const uint32_t interval_ms, const uint32_t queue_max)
+{
+    topic_hub_send_result_t result = { TOPIC_HUB_SEND_OK, 0, 0 };
+
+    if (hub == NULL) {
+        return result;
+    }
+
+    zend_coroutine_t *const coroutine = ZEND_ASYNC_CURRENT_COROUTINE;
+
+    /* The caller chose the reliable path; with no coroutine to park we refuse
+     * rather than degrade to best-effort publish() (finding 5). Checked BEFORE any
+     * delivery so a NO_CONTEXT send is all-or-nothing. */
+    if (coroutine == NULL || ZEND_ASYNC_IS_SCHEDULER_CONTEXT) {
+        result.status = TOPIC_HUB_SEND_NO_CONTEXT;
+        return result;
+    }
+
+    ws_local_t *const local = ws_local_of(hub);
+
+    retry_target_t full[TOPIC_HUB_MAX_WORKERS];
+    uint32_t       nfull;
+    ws_payload_t  *payload;
+
+    const uint32_t posted = topic_hub_send_fanout(hub, local, topic, topic_len,
+        data, len, binary, except_id, full, &nfull, &payload);
+
+    if (nfull == 0) {
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        result.delivered = posted;
+        return result;   /* OK — delivered outright */
+    }
+
+    /* No attachment ⇒ no outbound queue. Distinct from a queue-full refusal, and
+     * not charged to retry_rejected — there is no queue to be full. */
+    if (local == NULL) {
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        result.status    = TOPIC_HUB_SEND_NO_QUEUE;
+        result.delivered = posted;
+        result.pending   = nfull;
+        return result;
+    }
+
+    if (local->retry_count >= queue_max) {
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        (void) ws_atomic_u64_add(&hub->retry_rejected, 1);
+        result.status    = TOPIC_HUB_SEND_QUEUE_FULL;
+        result.delivered = posted;
+        result.pending   = nfull;
+        return result;
+    }
+
+    /* In-thread event (count()'s reasoning): the drainer that fires it runs on THIS
+     * thread, so its non-atomic ref_count is safe. */
+    zend_async_event_t *const done = async_plain_event_new();
+
+    if (UNEXPECTED(done == NULL)) {
+        /* Cannot park a blocking waiter — report an at-capacity refusal rather than
+         * silently losing the message. */
+        if (payload != NULL) {
+            ws_payload_release(payload);
+        }
+
+        (void) ws_atomic_u64_add(&hub->retry_rejected, 1);
+        result.status    = TOPIC_HUB_SEND_QUEUE_FULL;
+        result.delivered = posted;
+        result.pending   = nfull;
+        return result;
+    }
+
+    /* refcount 2: this caller holds one across the suspend, the queue the other. */
+    retry_entry_t *const e = retry_entry_new(topic, topic_len, payload, except_id,
+        ZEND_ASYNC_NOW() + timeout_ms, full, nfull, /*waiter*/ done);
+
+    if (UNEXPECTED(!topic_hub_retry_enqueue(hub, local, e, interval_ms))) {
+        /* The drainer would not arm; parking here would suspend on an event nothing
+         * ever fires (we run no timeout waker of our own). Refuse before suspending:
+         * dispose our event, discard the never-serviced entry, report queue-full. */
+        done->dispose(done);
+        retry_entry_discard(e);
+        (void) ws_atomic_u64_add(&hub->retry_rejected, 1);
+        result.status    = TOPIC_HUB_SEND_QUEUE_FULL;
+        result.delivered = posted;
+        result.pending   = nfull;
+        return result;
+    }
+
+    (void) ws_atomic_u64_add(&hub->retry_queued, (int64_t) nfull);
+
+    /* Park on the entry's event. NO timeout waker — the DRAINER owns the deadline
+     * and fires this on success OR expiry (arm-failure above guarantees a tick is
+     * coming). Cooperative scheduling guarantees the first tick cannot fire before
+     * we suspend (count()'s structural guarantee). An exception on resume is a
+     * cancellation and we do not swallow it. */
+    zend_async_resume_when(coroutine, done, false, zend_async_waker_callback_resolve, NULL);
+    ZEND_ASYNC_SUSPEND();
+    zend_async_waker_clean(coroutine);
+
+    /* Resumed. We still hold a reference, so these reads are valid even though the
+     * drainer may already have unlinked and payload-released the entry. */
+    const uint32_t entry_delivered = e->delivered;
+    const uint32_t entry_pending   = e->npending;
+    const bool     entry_shutdown  = e->shutdown;
+
+    /* Settle our side: abandon and clear the waiter before disposing the event we
+     * own, so any terminal step still to run skips the fire (the handshake — there
+     * is no cross-thread racer in-thread, but this is the contract). */
+    e->abandoned = true;
+    e->waiter    = NULL;
+    done->dispose(done);
+    retry_entry_release(e);
+
+    result.delivered = posted + entry_delivered;
+
+    if (entry_shutdown) {
+        result.status  = TOPIC_HUB_SEND_SHUTDOWN;   /* our worker detached — not a timeout */
+        result.pending = entry_pending;
+    } else if (entry_pending == 0) {
+        result.status  = TOPIC_HUB_SEND_OK;
+        result.pending = 0;
+    } else {
+        result.status  = TOPIC_HUB_SEND_EXPIRED;
+        result.pending = entry_pending;
+    }
+
+    return result;
 }
