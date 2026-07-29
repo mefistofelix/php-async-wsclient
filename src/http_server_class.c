@@ -6615,33 +6615,51 @@ static void http_server_transit_static_release(http_server_transit_static_t *t)
  * and after LOAD (consumed closures release as empty skeletons). */
 static void http_server_release_worker_shell(zval *transit)
 {
-    if (Z_TYPE_P(transit) == IS_OBJECT) {
-        http_server_object *shell = http_server_from_obj(Z_OBJ_P(transit));
+    if (Z_TYPE_P(transit) != IS_OBJECT) {
+        ZEND_ASYNC_THREAD_RELEASE_TRANSFERRED_ZVAL(transit);
 
-        pool_ctl_release(shell->pool_ctl);
-        shell->pool_ctl = NULL;
-
-        if (Z_TYPE(shell->config) == IS_OBJECT) {
-            ZEND_ASYNC_THREAD_RELEASE_TRANSFERRED_ZVAL(&shell->config);
-        }
-
-        http_server_transit_handlers_t *th = shell->transit_handlers;
-
-        if (th != NULL) {
-            for (size_t i = 0; i < th->count; i++) {
-                ZEND_ASYNC_THREAD_RELEASE_TRANSFERRED_ZVAL(&th->entries[i].closure);
-            }
-
-            pefree(th, 1);
-        }
-
-        http_server_transit_static_release(
-            (http_server_transit_static_t *) shell->transit_static_mounts);
-
-        pefree(shell, 1);
+        return;
     }
 
-    ZEND_ASYNC_THREAD_RELEASE_TRANSFERRED_ZVAL(transit);
+    http_server_object *shell = http_server_from_obj(Z_OBJ_P(transit));
+
+    pool_ctl_release(shell->pool_ctl);
+    shell->pool_ctl = NULL;
+
+    http_server_transit_handlers_t *th = shell->transit_handlers;
+
+    /* Release every transferred root of this shell — config, each handler closure,
+     * and the shell object itself — under ONE visited set. A handler that captured
+     * $server carries a bound var pointing at the SAME transferred object as
+     * `transit` (xlat-deduped when the shell was transferred); releasing the roots
+     * a call each — a fresh visited set per call — freed that shared object twice
+     * (the shutdown-while-un-LOADed double-free). Roots are gathered before the
+     * release and `th`/`shell` freed after, since the release reads them. */
+    zval  *roots[HTTP_SERVER_TRANSIT_MAX + 2];
+    size_t n = 0;
+
+    if (Z_TYPE(shell->config) == IS_OBJECT) {
+        roots[n++] = &shell->config;
+    }
+
+    if (th != NULL) {
+        for (size_t i = 0; i < th->count; i++) {
+            roots[n++] = &th->entries[i].closure;
+        }
+    }
+
+    roots[n++] = transit;
+
+    ZEND_ASYNC_THREAD_RELEASE_TRANSFERRED_ZVALS(roots, n);
+
+    if (th != NULL) {
+        pefree(th, 1);
+    }
+
+    http_server_transit_static_release(
+        (http_server_transit_static_t *) shell->transit_static_mounts);
+
+    pefree(shell, 1);
 }
 
 static zend_object *http_server_transfer_obj(
