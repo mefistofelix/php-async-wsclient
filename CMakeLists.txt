@@ -388,6 +388,7 @@ if(ENABLE_WEBSOCKET)
         deps/wslay/lib/wslay_stack.c
         src/websocket/websocket_strategy.c
         src/websocket/ws_session.c
+        src/websocket/ws_client.c
         src/websocket/ws_handshake.c
         src/websocket/ws_dispatch.c
         src/websocket/php_websocket.c

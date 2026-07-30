@@ -11,6 +11,7 @@
 #endif
 
 #include "php.h"
+#include "ext/random/php_random_csprng.h"
 #include "websocket/ws_session.h"
 #include "websocket/topic_hub.h"
 #include "websocket/ws_topic_tree.h"
@@ -22,6 +23,7 @@
 #include <wslay/wslay.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 #ifdef HAVE_HTTP_COMPRESSION
@@ -145,8 +147,7 @@ static ssize_t ws_session_send_callback(wslay_event_context_ptr ctx,
     (void)flags;
     ws_session_t *const s = (ws_session_t *)user_data;
 
-    if (UNEXPECTED(s->write_error) || UNEXPECTED(s->conn == NULL)
-        || UNEXPECTED(s->transport == NULL)) {
+    if (UNEXPECTED(s->write_error) || UNEXPECTED(s->transport == NULL)) {
         wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
         return -1;
     }
@@ -1054,6 +1055,50 @@ ws_writable_t ws_session_wait_writable(ws_session_t *session, uint32_t timeout_m
  * outbound frames). Server contexts never invoke it; leaving the slot
  * NULL in the callbacks struct is safe per wslay docs. */
 
+/* Client frames require a fresh cryptographically random masking key (RFC
+ * 6455 §5.3). Reuse PHP's CSPRNG; TLS remains entirely in PHP streams. */
+static int ws_session_client_genmask(wslay_event_context_ptr ctx,
+                                     uint8_t *buf, size_t len, void *user_data)
+{
+    (void) ctx;
+    (void) user_data;
+
+    return php_random_bytes_throw(buf, len) == SUCCESS ? 0 : -1;
+}
+
+ws_session_t *ws_session_init_client(const ws_transport_ops_t *transport,
+                                     void *transport_ctx)
+{
+    if (UNEXPECTED(transport == NULL || transport->send == NULL ||
+                   transport->send_internal == NULL)) {
+        return NULL;
+    }
+
+    ws_session_t *const s = ecalloc(1, sizeof(*s));
+    s->transport     = transport;
+    s->transport_ctx = transport_ctx;
+    s->is_client     = 1;
+
+    const struct wslay_event_callbacks cb = {
+        .recv_callback                 = ws_session_recv_callback,
+        .send_callback                 = ws_session_send_callback,
+        .genmask_callback              = ws_session_client_genmask,
+        .on_frame_recv_start_callback  = NULL,
+        .on_frame_recv_chunk_callback  = NULL,
+        .on_frame_recv_end_callback    = NULL,
+        .on_msg_recv_callback          = ws_session_on_msg_recv_callback,
+    };
+
+    if (wslay_event_context_client_init(&s->ctx, &cb, s) != 0) {
+        efree(s);
+        return NULL;
+    }
+
+    wslay_event_config_set_max_recv_msg_length(s->ctx, 1024 * 1024);
+    s->recv_queue_cap = 8 * 1024 * 1024;
+    return s;
+}
+
 ws_session_t *ws_session_init(http_connection_t *conn)
 {
     /* H1 / wss convenience wrapper: bind the transport to the whole
@@ -1150,7 +1195,9 @@ void ws_session_destroy(ws_session_t *session)
 
     /* Single teardown point for both transports — H1 via the strategy, H2 via
      * the stream — so a subscription cannot outlive the session. */
-    ws_topic_unsubscribe_all(topic_hub_tree(session->hub), session);
+    if (session->hub != NULL) {
+        ws_topic_unsubscribe_all(topic_hub_tree(session->hub), session);
+    }
 
     /* Tear down the keepalive timer first so a late fire cannot
      * race against the wslay context free below. The cb struct

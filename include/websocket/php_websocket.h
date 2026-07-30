@@ -14,6 +14,7 @@
 #include "websocket/ws_session.h"
 
 typedef struct http_request_t http_request_t;
+typedef struct ws_client_connection_t ws_client_connection_t;
 
 /* Class entries — populated by ws_php_classes_register() at MINIT
  * and read from anywhere that constructs / type-checks WS objects. */
@@ -56,7 +57,9 @@ void ws_php_classes_register(void);
  * to this object via handler_refcount (see http_connection.h).
  */
 typedef struct {
-    ws_session_t   *session;          /* borrowed; cleared on connection teardown */
+    ws_session_t   *session;          /* borrowed server session or owned client session */
+    bool            owns_session;     /* true only for WebSocketClient objects */
+    ws_client_connection_t *client;   /* owned with an outgoing-client WebSocket */
     zend_string    *subprotocol;      /* selected subprotocol (NULL = none); owned */
     /* Peer, snapshotted at upgrade while conn is guaranteed alive. Bare IP —
      * the port is separate, never glued into the string (see http_sockaddr_ip).
@@ -144,6 +147,12 @@ websocket_upgrade_from_obj(zend_object *obj) {
  */
 zend_object *websocket_object_create_pre_commit(http_connection_t *conn,
                                                 const char *accept_value);
+
+zend_object *websocket_object_create_client(ws_session_t *session,
+                                            ws_client_connection_t *client,
+                                            zend_string *subprotocol,
+                                            zend_string *remote_address,
+                                            uint16_t remote_port);
 
 /*
  * Drive the deferred upgrade through to completion. Invoked from the

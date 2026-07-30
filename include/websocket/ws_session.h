@@ -103,6 +103,9 @@ typedef struct ws_session_t {
     const ws_transport_ops_t *transport;
     void                     *transport_ctx;
 
+    /* RFC 6455 endpoint role. Client contexts mask every outbound frame. */
+    unsigned                  is_client : 1;
+
     /* Inbound staging buffer. Filled by ws_session_feed() from the
      * connection's read pipeline; drained by ws_session_recv_callback.
      * Sized for one max-frame worth — overflow returns WOULDBLOCK to
@@ -259,6 +262,11 @@ ws_session_t *ws_session_init(http_connection_t *conn);
 ws_session_t *ws_session_init_ex(http_connection_t *conn,
                                  const ws_transport_ops_t *transport,
                                  void *transport_ctx);
+
+/* Create an outgoing RFC 6455 client session. The caller owns the returned
+ * session and its transport context. */
+ws_session_t *ws_session_init_client(const ws_transport_ops_t *transport,
+                                     void *transport_ctx);
 
 /*
  * Tear down the wslay context and free the session. Idempotent —

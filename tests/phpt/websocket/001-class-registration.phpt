@@ -9,6 +9,8 @@ namespace TrueAsync;
 
 $classes = [
     WebSocket::class,
+    WebSocketClient::class,
+    WebSocketClientConfig::class,
     WebSocketMessage::class,
     WebSocketUpgrade::class,
     WebSocketException::class,
@@ -34,6 +36,8 @@ while ($h !== false) {
 echo "Done\n";
 --EXPECT--
 TrueAsync\WebSocket: class
+TrueAsync\WebSocketClient: class
+TrueAsync\WebSocketClientConfig: class
 TrueAsync\WebSocketMessage: class
 TrueAsync\WebSocketUpgrade: class
 TrueAsync\WebSocketException: class

@@ -20,6 +20,7 @@
 #include "websocket/topic_hub.h"
 #include "websocket/ws_topic_tree.h"
 #include "websocket/ws_handshake.h"
+#include "websocket/ws_client.h"
 #include "websocket/websocket_strategy.h"
 #include "core/http_connection.h"
 #include "core/http_connection_internal.h"  /* http_connection_tls_arm_read */
@@ -105,6 +106,8 @@ static zend_object *websocket_create(zend_class_entry *ce)
     websocket_object *obj = zend_object_alloc(sizeof(*obj), ce);
 
     obj->session        = NULL;
+    obj->owns_session   = false;
+    obj->client         = NULL;
     obj->subprotocol    = NULL;
     obj->remote_address = NULL;
     obj->closed         = true;   /* default-closed; the factory clears this */
@@ -126,6 +129,15 @@ static zend_object *websocket_create(zend_class_entry *ce)
 static void websocket_free(zend_object *obj)
 {
     websocket_object *w = websocket_from_obj(obj);
+
+    if (w->owns_session && w->client != NULL) {
+        ws_client_connection_close(w->client);
+        w->client = NULL;
+        w->session = NULL;
+    } else if (w->owns_session && w->session != NULL) {
+        ws_session_destroy(w->session);
+        w->session = NULL;
+    }
 
     /* Session is borrowed — the connection layer owns it and may
      * have already torn it down, in which case w->session is NULL.
@@ -210,6 +222,7 @@ zend_object *websocket_object_create_pre_commit(http_connection_t *conn,
     websocket_object *w = websocket_from_obj(obj);
 
     w->session   = NULL;          /* created by commit_upgrade */
+    w->owns_session = false;
     w->closed    = false;         /* open from the handler's perspective */
     w->committed = false;         /* not yet — handler runs first */
     w->conn      = conn;
@@ -222,6 +235,26 @@ zend_object *websocket_object_create_pre_commit(http_connection_t *conn,
     w->remote_address = http_connection_remote_address(conn);
     w->remote_port    = http_connection_remote_port(conn);
 
+    return obj;
+}
+
+zend_object *websocket_object_create_client(ws_session_t *session,
+                                            ws_client_connection_t *client,
+                                            zend_string *subprotocol,
+                                            zend_string *remote_address,
+                                            const uint16_t remote_port)
+{
+    zend_object *const obj = websocket_create(websocket_ce);
+    websocket_object *const w = websocket_from_obj(obj);
+
+    w->session        = session;
+    w->owns_session   = true;
+    w->client         = client;
+    w->closed         = false;
+    w->committed      = true;
+    w->subprotocol    = subprotocol != NULL ? zend_string_copy(subprotocol) : NULL;
+    w->remote_address = remote_address != NULL ? zend_string_copy(remote_address) : NULL;
+    w->remote_port    = remote_port;
     return obj;
 }
 
@@ -691,6 +724,15 @@ static void ws_do_recv(websocket_object *const w, zval *return_value)
             RETURN_THROWS();
         }
 
+        /* Outgoing clients have no server connection read strategy. Their
+         * PHP socket stream is TrueAsync-aware, so one read parks only this
+         * recv() coroutine and its bytes are then fed into the shared Wslay
+         * session/FIFO pipeline. */
+        if (w->client != NULL) {
+            (void) ws_client_connection_recv(w->client);
+            continue;
+        }
+
         /* Need to suspend until on_msg_recv_callback (or peer FIN)
          * notifies the recv_event. Lazy-create the trigger event
          * so connections that never actually call recv() pay no
@@ -1058,7 +1100,8 @@ ZEND_METHOD(TrueAsync_WebSocket, isClosed)
      * and also true on a default-constructed object that was never
      * bound to a session — which is what the private constructor +
      * Reflection-instantiation case looks like. */
-    RETURN_BOOL(w->closed || w->session == NULL);
+    RETURN_BOOL(w->closed || w->session == NULL ||
+                (w->client != NULL && ws_client_connection_is_closed(w->client)));
 }
 
 ZEND_METHOD(TrueAsync_WebSocket, getSubprotocol)
@@ -1354,4 +1397,6 @@ void ws_php_classes_register(void)
         register_class_TrueAsync_WebSocketConcurrentReadException(websocket_exception_ce);
     room_delivery_exception_ce =
         register_class_TrueAsync_RoomDeliveryException(websocket_exception_ce);
+
+    ws_client_php_classes_register();
 }

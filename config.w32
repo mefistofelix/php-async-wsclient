@@ -96,6 +96,23 @@ if (PHP_TRUE_ASYNC_SERVER == "yes") {
         "http_static.c " +
         "http_static_safety.c ";
 
+    var http_server_websocket =
+        "php_websocket.c " +
+        "websocket_strategy.c " +
+        "ws_session.c " +
+        "ws_client.c " +
+        "ws_handshake.c " +
+        "ws_dispatch.c " +
+        "topic_hub.c " +
+        "ws_topic_tree.c ";
+
+    var http_server_wslay =
+        "wslay_event.c " +
+        "wslay_frame.c " +
+        "wslay_net.c " +
+        "wslay_queue.c " +
+        "wslay_stack.c ";
+
     // llhttp bundled
     var http_server_llhttp =
         "llhttp.c " +
@@ -108,6 +125,8 @@ if (PHP_TRUE_ASYNC_SERVER == "yes") {
     ADD_SOURCES(configure_module_dirname + "/src/formats", http_server_formats, "true_async_server");
     ADD_SOURCES(configure_module_dirname + "/src/log",     http_server_log,     "true_async_server");
     ADD_SOURCES(configure_module_dirname + "/src/static",  http_server_static,  "true_async_server");
+    ADD_SOURCES(configure_module_dirname + "/src/websocket", http_server_websocket, "true_async_server");
+    ADD_SOURCES(configure_module_dirname + "/deps/wslay/lib", http_server_wslay, "true_async_server");
     ADD_SOURCES(configure_module_dirname + "/deps/llhttp", http_server_llhttp,  "true_async_server");
 
     // Include paths
@@ -118,6 +137,8 @@ if (PHP_TRUE_ASYNC_SERVER == "yes") {
     ADD_FLAG("CFLAGS_TRUE_ASYNC_SERVER", "/I " + configure_module_dirname + "/src");
     ADD_FLAG("CFLAGS_TRUE_ASYNC_SERVER", "/I " + configure_module_dirname + "/src/core");
     ADD_FLAG("CFLAGS_TRUE_ASYNC_SERVER", "/I " + configure_module_dirname + "/deps/llhttp/include");
+    ADD_FLAG("CFLAGS_TRUE_ASYNC_SERVER", "/I " + configure_module_dirname + "/deps/wslay/includes");
+    ADD_FLAG("CFLAGS_TRUE_ASYNC_SERVER", "/I " + configure_module_dirname + "/include/websocket");
     // moodycamel inter-thread queue headers (issue #81), consumed by thread_queue.cc.
     ADD_FLAG("CFLAGS_TRUE_ASYNC_SERVER", "/I " + configure_module_dirname + "/deps/concurrentqueue");
     // static/ files include each other by short name (e.g. "static/http_static_safety.h")

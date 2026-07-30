@@ -700,3 +700,42 @@ endif()
 
 # Install test binaries (optional)
 # install(TARGETS test_http1_parser test_http1_parser_edge_cases test_multipart_parser DESTINATION bin/tests)
+
+# Client-side RFC 6455 handshake rendering and response validation.  This is
+# deliberately transport-free: keeping it as a unit target lets us exercise
+# malformed server replies without opening a socket.
+add_executable(test_ws_client_handshake
+    websocket/test_ws_client_handshake.c
+    ${CMAKE_SOURCE_DIR}/../src/websocket/ws_client.c
+    ${CMAKE_SOURCE_DIR}/../src/websocket/ws_handshake.c
+)
+target_compile_definitions(test_ws_client_handshake PRIVATE WS_CLIENT_HANDSHAKE_TEST=1)
+
+target_include_directories(test_ws_client_handshake PRIVATE
+    ${CMAKE_SOURCE_DIR}/../include
+    ${CMAKE_SOURCE_DIR}/../include/http1
+    ${CMAKE_SOURCE_DIR}/../include/websocket
+    ${CMAKE_SOURCE_DIR}/../src
+)
+
+target_link_libraries(test_ws_client_handshake
+    test_common
+    ${CMOCKA_LIBRARIES}
+    ${CMAKE_DL_LIBS}
+)
+
+if(UNIX)
+    target_link_libraries(test_ws_client_handshake m pthread)
+endif()
+
+add_test(NAME WebSocketClientHandshake COMMAND test_ws_client_handshake)
+
+if(WIN32)
+    set_tests_properties(WebSocketClientHandshake PROPERTIES
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${PHP_DLL_DIR};PATH=path_list_prepend:${CMOCKA_DLL_DIR}"
+    )
+elseif(UNIX AND NOT APPLE)
+    set_tests_properties(WebSocketClientHandshake PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${PHP_PREFIX}/lib:$ENV{LD_LIBRARY_PATH}"
+    )
+endif()
