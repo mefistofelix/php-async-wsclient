@@ -14,6 +14,7 @@ if test "$PHP_TRUE_ASYNC_WSCLIENT" != "no"; then
     src/wsclient/wsclient_connection.c
     deps/wslay/lib/wslay_event.c
     deps/wslay/lib/wslay_frame.c
+    deps/wslay/lib/wslay_net.c
     deps/wslay/lib/wslay_queue.c
     deps/wslay/lib/wslay_stack.c
   ], [$ext_shared])
