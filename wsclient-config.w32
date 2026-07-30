@@ -1,4 +1,4 @@
-ARG_ENABLE("true_async_wsclient",
+ARG_ENABLE("true-async-wsclient",
   "Enable native TrueAsync WebSocket client support", "yes");
 
 if (PHP_TRUE_ASYNC_WSCLIENT == "yes") {
