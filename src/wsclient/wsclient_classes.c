@@ -16,6 +16,20 @@ zend_class_entry *wsclient_connection_ce = NULL;
 zend_class_entry *wsclient_message_ce = NULL;
 zend_class_entry *wsclient_exception_ce = NULL;
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_wsclient_none, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_wsclient_connect, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, headers, IS_ARRAY, 0, "[]")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, subprotocols, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_wsclient_send, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, data, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, binary, _IS_BOOL, 0, "false")
+ZEND_END_ARG_INFO()
+
 ZEND_METHOD(TrueAsync_WebSocketClient, __construct)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -142,25 +156,25 @@ ZEND_METHOD(TrueAsync_WebSocketClientMessage, isBinary)
 }
 
 static const zend_function_entry wsclient_methods[] = {
-    ZEND_ME(TrueAsync_WebSocketClient, __construct, NULL, ZEND_ACC_PRIVATE)
-    ZEND_ME(TrueAsync_WebSocketClient, connect, NULL, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(TrueAsync_WebSocketClient, __construct, arginfo_wsclient_none, ZEND_ACC_PRIVATE)
+    ZEND_ME(TrueAsync_WebSocketClient, connect, arginfo_wsclient_connect, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_FE_END
 };
 
 static const zend_function_entry wsclient_connection_methods[] = {
-    ZEND_ME(TrueAsync_WebSocketClientConnection, __construct, NULL, ZEND_ACC_PRIVATE)
-    ZEND_ME(TrueAsync_WebSocketClientConnection, send, NULL, ZEND_ACC_PUBLIC)
-    ZEND_ME(TrueAsync_WebSocketClientConnection, receive, NULL, ZEND_ACC_PUBLIC)
-    ZEND_ME(TrueAsync_WebSocketClientConnection, close, NULL, ZEND_ACC_PUBLIC)
-    ZEND_ME(TrueAsync_WebSocketClientConnection, isClosed, NULL, ZEND_ACC_PUBLIC)
-    ZEND_ME(TrueAsync_WebSocketClientConnection, getSubprotocol, NULL, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientConnection, __construct, arginfo_wsclient_none, ZEND_ACC_PRIVATE)
+    ZEND_ME(TrueAsync_WebSocketClientConnection, send, arginfo_wsclient_send, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientConnection, receive, arginfo_wsclient_none, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientConnection, close, arginfo_wsclient_none, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientConnection, isClosed, arginfo_wsclient_none, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientConnection, getSubprotocol, arginfo_wsclient_none, ZEND_ACC_PUBLIC)
     ZEND_FE_END
 };
 
 static const zend_function_entry wsclient_message_methods[] = {
-    ZEND_ME(TrueAsync_WebSocketClientMessage, __construct, NULL, ZEND_ACC_PRIVATE)
-    ZEND_ME(TrueAsync_WebSocketClientMessage, data, NULL, ZEND_ACC_PUBLIC)
-    ZEND_ME(TrueAsync_WebSocketClientMessage, isBinary, NULL, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientMessage, __construct, arginfo_wsclient_none, ZEND_ACC_PRIVATE)
+    ZEND_ME(TrueAsync_WebSocketClientMessage, data, arginfo_wsclient_none, ZEND_ACC_PUBLIC)
+    ZEND_ME(TrueAsync_WebSocketClientMessage, isBinary, arginfo_wsclient_none, ZEND_ACC_PUBLIC)
     ZEND_FE_END
 };
 
