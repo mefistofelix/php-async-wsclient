@@ -17,7 +17,10 @@ bool wsclient_compute_accept(const char *const key, const size_t key_len,
 {
     static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     PHP_SHA1_CTX context;
-    unsigned char digest[PHP_SHA1_DIGEST_LENGTH];
+    /* PHP exposes the SHA-1 finalizer with its RFC-defined 20-byte output;
+     * unlike some OpenSSL headers it deliberately does not export a length
+     * macro. */
+    unsigned char digest[20];
 
     if (key == NULL || key_len != WSCLIENT_KEY_LENGTH || out == NULL) {
         return false;
