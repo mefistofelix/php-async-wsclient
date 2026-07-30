@@ -9,8 +9,10 @@
 #include "ext/standard/base64.h"
 #include "ext/standard/url.h"
 #include "main/php_streams.h"
-#include "main/streams/php_stream_transport.h"
+#include "zend_exceptions.h"
 #include "zend_smart_str.h"
+
+#include <stddef.h>
 
 #include "wsclient/php_wsclient.h"
 #include "wsclient/wsclient_connection.h"
@@ -24,12 +26,12 @@ static zend_object_handlers wsclient_message_handlers;
 
 wsclient_connection_object *wsclient_connection_from_obj(zend_object *object)
 {
-    return (wsclient_connection_object *)((char *) object - XtOffsetOf(wsclient_connection_object, std));
+    return (wsclient_connection_object *)((char *) object - offsetof(wsclient_connection_object, std));
 }
 
 wsclient_message_object *wsclient_message_from_obj(zend_object *object)
 {
-    return (wsclient_message_object *)((char *) object - XtOffsetOf(wsclient_message_object, std));
+    return (wsclient_message_object *)((char *) object - offsetof(wsclient_message_object, std));
 }
 
 static void wsclient_connection_free(zend_object *object)
@@ -69,10 +71,10 @@ zend_object *wsclient_message_new(zend_class_entry *ce)
 void wsclient_connection_handlers_init(void)
 {
     memcpy(&wsclient_connection_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
-    wsclient_connection_handlers.offset = XtOffsetOf(wsclient_connection_object, std);
+    wsclient_connection_handlers.offset = offsetof(wsclient_connection_object, std);
     wsclient_connection_handlers.free_obj = wsclient_connection_free;
     memcpy(&wsclient_message_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
-    wsclient_message_handlers.offset = XtOffsetOf(wsclient_message_object, std);
+    wsclient_message_handlers.offset = offsetof(wsclient_message_object, std);
     wsclient_message_handlers.free_obj = wsclient_message_free;
 }
 
