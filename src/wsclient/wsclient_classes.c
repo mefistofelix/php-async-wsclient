@@ -186,5 +186,4 @@ void wsclient_register_classes(void)
         ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES | ZEND_ACC_NOT_SERIALIZABLE);
     wsclient_message_ce->create_object = wsclient_message_new;
 
-    wsclient_connection_handlers_init();
 }

@@ -52,6 +52,9 @@ static void wsclient_message_free(zend_object *object)
 
 zend_object *wsclient_connection_new(zend_class_entry *ce)
 {
+    if (wsclient_connection_handlers.free_obj == NULL) {
+        wsclient_connection_handlers_init();
+    }
     wsclient_connection_object *connection = zend_object_alloc(sizeof(*connection), ce);
     zend_object_std_init(&connection->std, ce);
     object_properties_init(&connection->std, ce);
@@ -61,6 +64,9 @@ zend_object *wsclient_connection_new(zend_class_entry *ce)
 
 zend_object *wsclient_message_new(zend_class_entry *ce)
 {
+    if (wsclient_message_handlers.free_obj == NULL) {
+        wsclient_connection_handlers_init();
+    }
     wsclient_message_object *message = zend_object_alloc(sizeof(*message), ce);
     zend_object_std_init(&message->std, ce);
     object_properties_init(&message->std, ce);
