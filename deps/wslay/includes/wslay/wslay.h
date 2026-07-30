@@ -31,7 +31,17 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/types.h>
+
+/* Wslay is bundled with the extension.  Its upstream public header assumes
+ * POSIX ssize_t and socket byte-order declarations; provide their native
+ * Windows equivalents when compiling the PHP DLL with MSVC. */
+#ifdef _WIN32
+# include <winsock2.h>
+# include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#else
+# include <sys/types.h>
+#endif
 
 
 /*
