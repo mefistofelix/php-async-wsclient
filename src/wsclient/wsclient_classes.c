@@ -173,17 +173,17 @@ void wsclient_register_classes(void)
 
     INIT_NS_CLASS_ENTRY(ce, "TrueAsync", "WebSocketClient", wsclient_methods);
     wsclient_ce = zend_register_internal_class_with_flags(&ce, NULL,
-        ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES | ZEND_ACC_NOT_SERIALIZABLE);
+        ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES);
 
     INIT_NS_CLASS_ENTRY(ce, "TrueAsync", "WebSocketClientConnection",
                         wsclient_connection_methods);
     wsclient_connection_ce = zend_register_internal_class_with_flags(&ce, NULL,
-        ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES | ZEND_ACC_NOT_SERIALIZABLE);
+        ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES);
     wsclient_connection_ce->create_object = wsclient_connection_new;
 
     INIT_NS_CLASS_ENTRY(ce, "TrueAsync", "WebSocketClientMessage", wsclient_message_methods);
     wsclient_message_ce = zend_register_internal_class_with_flags(&ce, NULL,
-        ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES | ZEND_ACC_NOT_SERIALIZABLE);
+        ZEND_ACC_FINAL | ZEND_ACC_NO_DYNAMIC_PROPERTIES);
     wsclient_message_ce->create_object = wsclient_message_new;
 
 }
