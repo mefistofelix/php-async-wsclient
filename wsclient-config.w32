@@ -1,0 +1,16 @@
+ARG_ENABLE("true_async_wsclient",
+  "Enable native TrueAsync WebSocket client support", "yes");
+
+if (PHP_TRUE_ASYNC_WSCLIENT == "yes") {
+  EXTENSION("true_async_wsclient",
+    "src/wsclient/wsclient_module.c " +
+    "src/wsclient/wsclient_classes.c " +
+    "src/wsclient/wsclient_handshake.c " +
+    "src/wsclient/wsclient_session.c " +
+    "deps/wslay/lib/wslay_event.c " +
+    "deps/wslay/lib/wslay_queue.c " +
+    "deps/wslay/lib/wslay_stack.c");
+  ADD_FLAG("CFLAGS_TRUE_ASYNC_WSCLIENT", "/I " + configure_module_dirname);
+  ADD_FLAG("CFLAGS_TRUE_ASYNC_WSCLIENT", "/I " + configure_module_dirname + "/include");
+  ADD_FLAG("CFLAGS_TRUE_ASYNC_WSCLIENT", "/I " + configure_module_dirname + "/deps/wslay/includes");
+}
