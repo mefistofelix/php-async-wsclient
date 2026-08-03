@@ -60,11 +60,13 @@ link or runtime.
 - The release repository is `mefistofelix/releases`. Release artifacts retain
   every original binary and `php_true_async_server`; add the separate
   `php_true_async_wsclient` artifact alongside them.
-- The verification workflow must build against the matching development pair,
-  load the extension, and check the public classes.
+- GitHub Actions must build and package against the matching development pair.
+  Do not run smoke, unit, or end-to-end tests in GitHub Actions; run them only
+  on a locally downloaded package.
 
 ## Completion
 
 Do not call the work complete until the client is self-contained, has no
 server runtime/class/build coupling, is integrated as an additional release
-artifact, and the GitHub build and smoke tests are green.
+artifact, the GitHub build is green, and local smoke and real WebSocket
+connect/send/receive tests pass against the downloaded package.
