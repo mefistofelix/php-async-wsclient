@@ -251,7 +251,11 @@ zend_object *wsclient_connection_create(zend_string *url, HashTable *headers, Ha
         : (memchr(ZSTR_VAL(host), ':', ZSTR_LEN(host)) ? strpprintf(0, "[%s]", ZSTR_VAL(host)) : (port == (secure ? 443 : 80) ? zend_string_copy(host) : strpprintf(0, "%s:%u", ZSTR_VAL(host), (unsigned)port)));
     stream = wsclient_open_stream(host, port, secure); if (!stream) goto done;
     { uint8_t bytes[16]; if (php_random_bytes_throw(bytes, sizeof(bytes)) == FAILURE) goto done; key = php_base64_encode(bytes, sizeof(bytes)); }
-    expected = zend_string_alloc(WSCLIENT_ACCEPT_LENGTH, 0); if (!key || wsclient_compute_accept(ZSTR_VAL(key), ZSTR_LEN(key), ZSTR_VAL(expected)) != 0) goto done;
+    expected = zend_string_alloc(WSCLIENT_ACCEPT_LENGTH, 0);
+    if (key == NULL || !wsclient_compute_accept(ZSTR_VAL(key), ZSTR_LEN(key), ZSTR_VAL(expected))) {
+        zend_throw_exception(wsclient_exception_ce, "Cannot prepare WebSocket handshake", 0);
+        goto done;
+    }
     request = wsclient_build_request(authority, target, key, headers, protocols); if (!request) { zend_throw_exception(wsclient_exception_ce, "Invalid WebSocket headers or subprotocols", 0); goto done; }
     { size_t sent = 0; while (sent < ZSTR_LEN(request)) { ssize_t n = php_stream_write(stream, ZSTR_VAL(request) + sent, ZSTR_LEN(request) - sent); if (n <= 0) { zend_throw_exception(wsclient_exception_ce, "Cannot write WebSocket handshake", 0); goto done; } sent += (size_t)n; } }
     while (!wsclient_header_end(response.s ? ZSTR_VAL(response.s) : "", response.s ? ZSTR_LEN(response.s) : 0, &header_end)) {

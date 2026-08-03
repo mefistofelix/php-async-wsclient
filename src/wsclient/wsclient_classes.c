@@ -60,6 +60,9 @@ ZEND_METHOD(TrueAsync_WebSocketClient, connect)
 
     zend_object *connection = wsclient_connection_create(url, headers, subprotocols);
     if (connection == NULL) {
+        if (!EG(exception)) {
+            zend_throw_exception(wsclient_exception_ce, "Cannot establish WebSocket connection", 0);
+        }
         RETURN_THROWS();
     }
     RETURN_OBJ(connection);
