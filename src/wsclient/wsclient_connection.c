@@ -152,7 +152,7 @@ static zend_string *wsclient_build_request(zend_string *authority, zend_string *
         ZSTR_LEN(target) == 0 || ZSTR_VAL(target)[0] != '/') return NULL;
     smart_str_appendl(&request, "GET ", 4); smart_str_append(&request, target);
     smart_str_appendl(&request, " HTTP/1.1\r\nHost: ", 17); smart_str_append(&request, authority);
-    smart_str_appendl(&request, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ", 61);
+    smart_str_appendl(&request, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ", 62);
     smart_str_append(&request, key);
     smart_str_appendl(&request, "\r\nSec-WebSocket-Version: 13\r\n", 29);
     if (protocols != NULL && zend_hash_num_elements(protocols) > 0) {
@@ -233,14 +233,15 @@ static php_stream *wsclient_open_stream(zend_string *host, uint16_t port, bool s
 
 zend_object *wsclient_connection_create(zend_string *url, HashTable *headers, HashTable *protocols)
 {
-    php_url *parsed = php_url_parse_ex2(ZSTR_VAL(url), ZSTR_LEN(url), NULL);
+    bool has_port = false;
+    php_url *parsed = php_url_parse_ex2(ZSTR_VAL(url), ZSTR_LEN(url), &has_port);
     bool secure; uint16_t port; zend_string *host = NULL, *target = NULL, *authority = NULL, *key = NULL, *request = NULL, *expected = NULL;
     php_stream *stream = NULL; smart_str response = {0}; size_t header_end = 0; zend_object *object = NULL;
     if (parsed == NULL || parsed->scheme == NULL || parsed->host == NULL || parsed->user || parsed->pass || parsed->fragment ||
         (!zend_string_equals_literal_ci(parsed->scheme, "ws") && !zend_string_equals_literal_ci(parsed->scheme, "wss"))) {
         if (parsed) php_url_free(parsed); zend_argument_value_error(1, "must be a valid ws:// or wss:// URL without credentials or a fragment"); return NULL;
     }
-    secure = zend_string_equals_literal_ci(parsed->scheme, "wss"); port = parsed->port ? parsed->port : (secure ? 443 : 80);
+    secure = zend_string_equals_literal_ci(parsed->scheme, "wss"); port = has_port ? parsed->port : (secure ? 443 : 80);
     host = zend_string_copy(parsed->host);
     if (wsclient_contains_crlf(host) || (parsed->path && wsclient_contains_crlf(parsed->path)) || (parsed->query && wsclient_contains_crlf(parsed->query))) goto invalid;
     if (parsed->path == NULL || ZSTR_LEN(parsed->path) == 0) target = zend_string_init("/", 1, 0); else target = zend_string_copy(parsed->path);
